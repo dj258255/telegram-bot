@@ -34,9 +34,10 @@ log = logging.getLogger("claude-bot")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 초
 
-# 코딩 모드: "bypassPermissions" 로 설정하면 Claude가 workspace 폴더 안에서
-# 실제 파일 생성/수정/명령 실행까지 한다. 비우면 대화 전용(안전).
-CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
+# 코딩 모드(기본 켜짐): Claude가 workspace 폴더 안에서 실제 파일 생성/수정/명령
+# 실행까지 한다. 대화 전용으로 바꾸려면 CLAUDE_PERMISSION_MODE=off 로 설정.
+_mode = os.environ.get("CLAUDE_PERMISSION_MODE", "bypassPermissions").strip()
+CLAUDE_PERMISSION_MODE = "" if _mode.lower() in ("", "off", "none") else _mode
 
 # 봇 전용 작업 폴더 — claude가 여기를 cwd로 실행됨
 WORKDIR = Path(__file__).parent / "workspace"
