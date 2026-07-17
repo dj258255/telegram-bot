@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -144,6 +145,23 @@ def save_sessions(sessions: dict[str, str]) -> None:
 
 sessions = load_sessions()
 chat_locks: dict[int, asyncio.Lock] = {}
+START_TIME = time.time()
+# 채팅방별 작업 디렉터리 오버라이드 (/cd 명령). 기본은 WORKDIR.
+chat_workdirs: dict[int, Path] = {}
+
+
+def fmt_uptime(seconds: float) -> str:
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, _ = divmod(s, 60)
+    parts = []
+    if d:
+        parts.append(f"{d}일")
+    if h:
+        parts.append(f"{h}시간")
+    parts.append(f"{m}분")
+    return " ".join(parts)
 
 
 
@@ -175,11 +193,12 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
 
     cmd.append(prompt)
 
+    workdir = chat_workdirs.get(chat_id, WORKDIR)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=WORKDIR,
+        cwd=str(workdir),
     )
     running_procs[chat_id] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
 
@@ -250,6 +269,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "사진·파일을 보내면 분석하고, 코딩도 실제로 해드려요.\n\n"
         "/new — 대화 초기화\n"
         "/model — 모델 확인·변경 (opus / sonnet)\n"
+        "/status — 봇 상태 확인\n"
+        "/cd — 작업 폴더 전환\n"
         f"\n당신의 유저 ID: {update.effective_user.id}"
     )
 
@@ -304,6 +325,51 @@ async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await tg_file.download_to_drive(custom_path=str(dest))
     log.info("첨부 저장: %s", dest)
     return str(dest)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    model = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+    workdir = chat_workdirs.get(chat_id, WORKDIR)
+    mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
+    busy = "작업 중" if chat_id in running_procs else "대기 중"
+    # 서버 부하 (load average)
+    try:
+        load1, load5, _ = os.getloadavg()
+        load = f"{load1:.2f} / {load5:.2f}"
+    except OSError:
+        load = "N/A"
+    await update.message.reply_text(
+        f"🤖 봇 상태\n"
+        f"- 가동시간: {fmt_uptime(time.time() - START_TIME)}\n"
+        f"- 모델: {model}\n"
+        f"- 모드: {mode}\n"
+        f"- 현재: {busy}\n"
+        f"- 저장된 대화: {len(sessions)}개\n"
+        f"- 작업 폴더: {workdir}\n"
+        f"- 서버 부하(1분/5분): {load}"
+    )
+
+
+async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    arg = " ".join(context.args).strip() if context.args else ""
+    if not arg or arg.lower() in ("reset", "default", "기본"):
+        chat_workdirs.pop(chat_id, None)
+        await update.message.reply_text(f"작업 폴더를 기본값으로 되돌렸어요.\n{WORKDIR}")
+        return
+    target = Path(arg).expanduser()
+    if not target.is_absolute():
+        target = WORKDIR / target
+    if not target.is_dir():
+        await update.message.reply_text(f"그런 폴더가 없어요: {target}")
+        return
+    chat_workdirs[chat_id] = target
+    await update.message.reply_text(f"작업 폴더를 바꿨어요:\n{target}")
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -365,6 +431,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 pass
 
         await refresh("🤔 작업 시작…")
+        work_start = asyncio.get_event_loop().time()
 
         async def on_progress(desc: str) -> None:
             nonlocal last_edit
@@ -383,7 +450,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except Exception:
             pass
-        for chunk in split_message(reply):
+        # 30초 넘게 걸린 긴 작업이면 완료 표시를 앞에 붙여 눈에 띄게
+        elapsed = asyncio.get_event_loop().time() - work_start
+        prefix = "✅ 완료!\n\n" if elapsed > 30 else ""
+        chunks = split_message(prefix + reply)
+        for chunk in chunks:
             await update.message.reply_text(chunk)
 
 
@@ -422,6 +493,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 모두 처리
     app.add_handler(MessageHandler(
