@@ -18,10 +18,11 @@ import os
 import uuid
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -119,6 +120,14 @@ SYSTEM_PROMPT = (
 
 TELEGRAM_MSG_LIMIT = 4000  # 실제 한도는 4096, 여유를 둠
 
+# 코딩 모드에서 명령 실행 전 취소할 수 있는 대기 시간(초). 0이면 대기 없음.
+CANCEL_DELAY = int(os.environ.get("CANCEL_DELAY", "4"))
+
+# 실행 중인 claude 프로세스 (중단 버튼이 죽일 수 있게 보관)
+running_procs: dict[int, asyncio.subprocess.Process] = {}
+# 시작 전 대기 중 취소 신호
+pending_cancel: dict[int, asyncio.Event] = {}
+
 
 def load_sessions() -> dict[str, str]:
     if SESSIONS_FILE.exists():
@@ -172,6 +181,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
         stderr=asyncio.subprocess.PIPE,
         cwd=WORKDIR,
     )
+    running_procs[chat_id] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
 
     final_text = ""
 
@@ -200,6 +210,12 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
     except asyncio.TimeoutError:
         proc.kill()
         return "⏰ 응답 시간이 너무 오래 걸려 중단했어요. 다시 시도해 주세요."
+    finally:
+        running_procs.pop(chat_id, None)
+
+    # 중단 버튼으로 죽인 경우 (kill → 음수 리턴코드)
+    if proc.returncode and proc.returncode < 0:
+        return "🛑 중단했어요. (진행 중이던 작업은 여기서 멈춥니다)"
 
     if proc.returncode != 0:
         stderr = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
@@ -304,8 +320,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("🤔 이전 질문에 아직 답하는 중이에요. 잠시만요…")
 
     async with lock:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
         attachment = await save_attachment(update, context)
         if attachment:
             # Claude가 읽을 수 있도록 저장 경로를 프롬프트에 포함
@@ -314,35 +328,86 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elif not prompt:
             return  # 내용 없는 메시지는 무시
 
-        # 진행 상황을 보여줄 메시지 하나를 띄우고, 작업이 진행될 때마다 편집한다
-        progress_msg = await update.message.reply_text("🤔 생각 중…")
+        # 코딩 모드면 실행 전 잠깐 취소 기회를 준다 (잘못 보낸 명령 방어)
+        status_msg = await update.message.reply_text("🤔 생각 중…")
+        if CLAUDE_PERMISSION_MODE and CANCEL_DELAY > 0:
+            cancel_ev = asyncio.Event()
+            pending_cancel[chat_id] = cancel_ev
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 취소", callback_data="cancel")]])
+            await context.bot.edit_message_text(
+                f"⏳ {CANCEL_DELAY}초 뒤 시작해요. 잘못 보냈다면 취소를 누르세요.",
+                chat_id=chat_id, message_id=status_msg.message_id, reply_markup=kb,
+            )
+            try:
+                await asyncio.wait_for(cancel_ev.wait(), timeout=CANCEL_DELAY)
+                await context.bot.edit_message_text(
+                    "🚫 취소했어요.", chat_id=chat_id, message_id=status_msg.message_id,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass  # 시간 지나면 그대로 진행
+            finally:
+                pending_cancel.pop(chat_id, None)
+
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        # 진행 상황 표시 + 중단 버튼
         actions: list[str] = []
         last_edit = 0.0
+        stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 중단", callback_data="stop")]])
+
+        async def refresh(text: str) -> None:
+            try:
+                await context.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=status_msg.message_id, reply_markup=stop_kb,
+                )
+            except Exception:
+                pass
+
+        await refresh("🤔 작업 시작…")
 
         async def on_progress(desc: str) -> None:
             nonlocal last_edit
             actions.append(desc)
             now = asyncio.get_event_loop().time()
-            # 텔레그램 편집 제한 대비 최소 1.5초 간격, 최근 6개만 표시
-            if now - last_edit < 1.5:
+            if now - last_edit < 1.5:  # 텔레그램 편집 제한 대비
                 return
             last_edit = now
-            body = "\n".join(actions[-6:])
-            try:
-                await context.bot.edit_message_text(body, chat_id=chat_id, message_id=progress_msg.message_id)
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            except Exception:
-                pass  # 편집 실패(동일 내용 등)는 무시
+            await refresh("\n".join(actions[-6:]))
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
         reply = await run_claude(chat_id, prompt, on_progress=on_progress)
 
-        # 진행 메시지는 지우고 최종 답변을 새로 보낸다
+        # 진행 메시지 지우고 최종 답변 전송
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
+            await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except Exception:
             pass
         for chunk in split_message(reply):
             await update.message.reply_text(chunk)
+
+
+async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """취소/중단 버튼 처리."""
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("권한이 없어요.")
+        return
+    chat_id = query.message.chat_id
+    if query.data == "cancel":
+        ev = pending_cancel.get(chat_id)
+        if ev:
+            ev.set()
+            await query.answer("취소했어요.")
+        else:
+            await query.answer("이미 시작됐어요. 중단 버튼을 쓰세요.")
+    elif query.data == "stop":
+        proc = running_procs.get(chat_id)
+        if proc:
+            proc.kill()
+            await query.answer("중단하는 중…")
+        else:
+            await query.answer("실행 중인 작업이 없어요.")
 
 
 def main() -> None:
@@ -357,6 +422,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 모두 처리
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
