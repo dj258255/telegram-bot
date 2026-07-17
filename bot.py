@@ -40,6 +40,10 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 초
 # 채팅 중 /model 명령으로 바꾸면 이 값을 덮어쓴다.
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 
+# 음성 메시지 → 텍스트 변환용 Groq API 키 (없으면 음성 기능 비활성)
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+
 # tool_use 이벤트를 텔레그램에 보여줄 사람말로 변환
 TOOL_LABELS = {
     "Write": "📝 파일 작성",
@@ -339,6 +343,50 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
 
 
+async def transcribe_voice(update: Update) -> str | None:
+    """음성/오디오 메시지를 Groq Whisper로 텍스트 변환. 없거나 실패하면 None."""
+    msg = update.message
+    media = msg.voice or msg.audio
+    if not media:
+        return None
+    if not GROQ_API_KEY:
+        await msg.reply_text(
+            "🎤 음성을 받았지만 변환 키(GROQ_API_KEY)가 없어요.\n"
+            "console.groq.com 에서 무료 키를 발급해 서버에 넣어주세요."
+        )
+        return None
+
+    tg_file = await media.get_file()
+    audio_path = UPLOADS_DIR / f"voice_{media.file_unique_id}.ogg"
+    await tg_file.download_to_drive(custom_path=str(audio_path))
+
+    import httpx
+    try:
+        with open(audio_path, "rb") as f:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    GROQ_STT_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    files={"file": (audio_path.name, f, "audio/ogg")},
+                    data={"model": "whisper-large-v3-turbo", "language": "ko"},
+                )
+        if resp.status_code != 200:
+            log.error("Groq 변환 실패 %s: %s", resp.status_code, resp.text[:200])
+            await msg.reply_text(f"🎤 음성 변환에 실패했어요. ({resp.status_code})")
+            return None
+        text = resp.json().get("text", "").strip()
+        return text or None
+    except Exception as e:
+        log.error("Groq 변환 예외: %s", e)
+        await msg.reply_text("🎤 음성 변환 중 오류가 났어요.")
+        return None
+    finally:
+        try:
+            audio_path.unlink()
+        except OSError:
+            pass
+
+
 async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
     """메시지에 사진/문서가 있으면 uploads/에 저장하고 파일 경로를 돌려준다."""
     msg = update.message
@@ -453,6 +501,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("🤔 이전 질문에 아직 답하는 중이에요. 잠시만요…")
 
     async with lock:
+        # 음성 메시지면 먼저 텍스트로 변환
+        if update.message.voice or update.message.audio:
+            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            transcript = await transcribe_voice(update)
+            if not transcript:
+                return  # 변환 실패 시 안내는 transcribe_voice가 이미 보냄
+            await update.message.reply_text(f"🎤 들은 내용: {transcript}")
+            prompt = transcript
+
         attachment = await save_attachment(update, context)
         if attachment:
             # Claude가 읽을 수 있도록 저장 경로를 프롬프트에 포함
@@ -569,9 +626,10 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CallbackQueryHandler(on_button))
-    # 텍스트 + 사진 + 문서 모두 처리
+    # 텍스트 + 사진 + 문서 + 음성/오디오 모두 처리
     app.add_handler(MessageHandler(
-        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL
+        | filters.VOICE | filters.AUDIO,
         on_message,
     ))
 
