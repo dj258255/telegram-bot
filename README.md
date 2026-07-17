@@ -30,21 +30,21 @@ export ALLOWED_USER_IDS="내_유저_ID"
 ### 최초 1회 셋업
 
 ```bash
-# 서버 접속 후:
-sudo dnf install -y python3 python3-pip git nodejs npm
+# 서버 접속 후: (PTB 22.x는 Python 3.10+ 필요 — Rocky 9 기본 3.9로는 안 됨)
+sudo dnf install -y python3.12 git nodejs npm
 
 # Claude CLI 설치
 sudo npm install -g @anthropic-ai/claude-code
 
-# 코드 받기
-git clone https://github.com/<계정>/telegram-bot.git ~/telegram-bot
+# 코드 받기 (비공개 저장소 → 서버에 deploy key 등록 필요)
+git clone git@github.com-telegram:dj258255/telegram-bot.git ~/telegram-bot
 cd ~/telegram-bot
-python3 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 환경변수 (.env — git 제외)
-cp .env.example .env && nano .env
-chmod 600 .env
+# 환경변수 — SELinux 때문에 /etc 에 둔다 (홈 디렉터리는 systemd가 못 읽음)
+sudo cp .env.example /etc/claude-bot.env && sudo nano /etc/claude-bot.env
+sudo chmod 600 /etc/claude-bot.env && sudo restorecon /etc/claude-bot.env
 
 # systemd 등록
 sudo cp deploy/claude-bot.service /etc/systemd/system/
@@ -53,7 +53,7 @@ sudo systemctl enable --now claude-bot
 systemctl status claude-bot
 ```
 
-`CLAUDE_CODE_OAUTH_TOKEN`은 **맥에서** `claude setup-token` 실행(브라우저 로그인)으로 발급해 `.env`에 넣는다.
+`CLAUDE_CODE_OAUTH_TOKEN`은 **맥에서** `claude setup-token` 실행(브라우저 로그인)으로 발급해 `/etc/claude-bot.env`에 넣는다.
 
 GitHub Actions가 재시작할 수 있도록 sudo 허용:
 

@@ -1,6 +1,11 @@
 # OCI 서버(Rocky Linux)에서 봇을 상시 실행하는 systemd 서비스
 # 설치: sudo cp deploy/claude-bot.service /etc/systemd/system/
 #       sudo systemctl daemon-reload && sudo systemctl enable --now claude-bot
+#
+# SELinux 주의 (Rocky/RHEL):
+#  - EnvironmentFile은 홈 디렉터리에 두면 거부됨 → /etc/claude-bot.env 사용
+#    (파일을 mv로 옮겼다면 `sudo restorecon /etc/claude-bot.env` 로 라벨 복구)
+#  - 홈 디렉터리의 .venv/bin/python 직접 실행도 거부됨 → 시스템 python + PYTHONPATH 사용
 [Unit]
 Description=Telegram Claude Bot
 After=network-online.target
@@ -10,9 +15,9 @@ Wants=network-online.target
 Type=simple
 User=rocky
 WorkingDirectory=/home/rocky/telegram-bot
-# 토큰들은 저장소 밖 .env에 (discord-bot과 동일 패턴, git 제외됨)
-EnvironmentFile=/home/rocky/telegram-bot/.env
-ExecStart=/home/rocky/telegram-bot/.venv/bin/python bot.py
+EnvironmentFile=/etc/claude-bot.env
+Environment=PYTHONPATH=/home/rocky/telegram-bot/.venv/lib/python3.12/site-packages
+ExecStart=/usr/bin/python3.12 /home/rocky/telegram-bot/bot.py
 Restart=always
 RestartSec=10
 
