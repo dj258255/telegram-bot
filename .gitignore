@@ -5,6 +5,7 @@ sessions.json
 # workspace: CLAUDE.md만 배포하고 나머지 런타임 산출물은 제외
 workspace/*
 !workspace/CLAUDE.md
+!workspace/.mcp.json
 
 # Python
 __pycache__/
@@ -12,3 +13,5 @@ __pycache__/
 .venv/
 venv/
 docs/DEPLOY-RECORD.local.md
+!workspace/.claude/
+!workspace/.claude/**

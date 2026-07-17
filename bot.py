@@ -70,6 +70,9 @@ WORKDIR.mkdir(exist_ok=True)
 UPLOADS_DIR = WORKDIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
 
+# MCP 서버 설정 (context7 등). 있으면 봇 실행 시 자동 로드.
+MCP_CONFIG = WORKDIR / ".mcp.json"
+
 # 채팅방별 세션 ID를 저장해서 봇을 재시작해도 대화가 이어지게 함
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 
@@ -108,6 +111,9 @@ async def run_claude(chat_id: int, prompt: str) -> str:
     cmd = [CLAUDE_BIN, "-p", "--output-format", "text"]
     if CLAUDE_PERMISSION_MODE:
         cmd += ["--permission-mode", CLAUDE_PERMISSION_MODE]
+    # workspace/.mcp.json 이 있으면 MCP 서버를 로드 (context7 등)
+    if MCP_CONFIG.exists():
+        cmd += ["--mcp-config", str(MCP_CONFIG)]
 
     if key in sessions:
         cmd += ["--resume", sessions[key]]
