@@ -111,9 +111,8 @@ async def run_claude(chat_id: int, prompt: str) -> str:
     cmd = [CLAUDE_BIN, "-p", "--output-format", "text"]
     if CLAUDE_PERMISSION_MODE:
         cmd += ["--permission-mode", CLAUDE_PERMISSION_MODE]
-    # workspace/.mcp.json 이 있으면 MCP 서버를 로드 (context7 등)
-    if MCP_CONFIG.exists():
-        cmd += ["--mcp-config", str(MCP_CONFIG)]
+    # MCP 서버(context7 등)는 cwd(workspace)의 .mcp.json 에서 자동 로드된다.
+    # --mcp-config 플래그는 뒤따르는 프롬프트를 인자로 삼켜버려 쓰지 않는다.
 
     if key in sessions:
         cmd += ["--resume", sessions[key]]
