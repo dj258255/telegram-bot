@@ -66,6 +66,10 @@ if CLAUDE_PERMISSION_MODE and not ALLOWED_IDS:
 WORKDIR = Path(__file__).parent / "workspace"
 WORKDIR.mkdir(exist_ok=True)
 
+# 텔레그램으로 받은 사진·파일을 저장하는 폴더 (Claude가 여기서 읽음)
+UPLOADS_DIR = WORKDIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
+
 # 채팅방별 세션 ID를 저장해서 봇을 재시작해도 대화가 이어지게 함
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 
@@ -172,13 +176,37 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🆕 새 대화를 시작합니다.")
 
 
+async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """메시지에 사진/문서가 있으면 uploads/에 저장하고 파일 경로를 돌려준다."""
+    msg = update.message
+    tg_file = None
+    filename = None
+
+    if msg.photo:  # 사진은 여러 해상도가 오는데 마지막 것이 가장 크다
+        tg_file = await msg.photo[-1].get_file()
+        filename = f"photo_{msg.photo[-1].file_unique_id}.jpg"
+    elif msg.document:
+        tg_file = await msg.document.get_file()
+        # 원본 파일명 유지하되 경로 조작 방지를 위해 basename만 사용
+        filename = os.path.basename(msg.document.file_name or f"file_{msg.document.file_unique_id}")
+
+    if not tg_file:
+        return None
+
+    dest = UPLOADS_DIR / filename
+    await tg_file.download_to_drive(custom_path=str(dest))
+    log.info("첨부 저장: %s", dest)
+    return str(dest)
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         log.info("허용되지 않은 사용자 차단: %s", update.effective_user.id if update.effective_user else "?")
         return
 
     chat_id = update.effective_chat.id
-    prompt = update.message.text
+    # 사진은 caption, 일반 메시지는 text 에 내용이 담긴다
+    prompt = (update.message.text or update.message.caption or "").strip()
 
     lock = chat_locks.setdefault(chat_id, asyncio.Lock())
     if lock.locked():
@@ -186,6 +214,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     async with lock:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+        attachment = await save_attachment(update, context)
+        if attachment:
+            # Claude가 읽을 수 있도록 저장 경로를 프롬프트에 포함
+            note = f"[사용자가 파일을 첨부함: {attachment}]"
+            prompt = f"{note}\n{prompt}" if prompt else f"{note}\n이 파일을 확인하고 설명해 주세요."
+        elif not prompt:
+            return  # 내용 없는 메시지는 무시
+
         reply = await run_claude(chat_id, prompt)
         for chunk in split_message(reply):
             await update.message.reply_text(chunk)
@@ -202,7 +239,11 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+    # 텍스트 + 사진 + 문서 모두 처리
+    app.add_handler(MessageHandler(
+        (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
+        on_message,
+    ))
 
     log.info("봇 시작! (작업 폴더: %s)", WORKDIR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)

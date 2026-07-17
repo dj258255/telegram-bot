@@ -1,7 +1,10 @@
 # 런타임에 생성되는 파일 — 커밋 금지
 sessions.json
-workspace/
 .env
+
+# workspace: CLAUDE.md만 배포하고 나머지 런타임 산출물은 제외
+workspace/*
+!workspace/CLAUDE.md
 
 # Python
 __pycache__/
