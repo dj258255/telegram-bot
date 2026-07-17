@@ -21,5 +21,9 @@ ExecStart=/usr/bin/python3.12 /home/rocky/telegram-bot/bot.py
 Restart=always
 RestartSec=10
 
+# balruno 격리: 봇(코딩 모드)이 balruno 데이터/설정을 절대 못 건드리게 차단.
+# 마운트 네임스페이스라 sudo로도 우회 불가. balruno 서비스 자체엔 영향 없음.
+InaccessiblePaths=/opt/balruno /var/lib/balruno /var/lib/balruno-backup /var/log/balruno
+
 [Install]
 WantedBy=multi-user.target
