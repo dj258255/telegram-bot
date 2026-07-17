@@ -34,6 +34,40 @@ log = logging.getLogger("claude-bot")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 초
 
+# 사용 모델. 비우면 구독 기본값(보통 Sonnet). "opus"/"sonnet" 또는 정확한 모델명.
+# 채팅 중 /model 명령으로 바꾸면 이 값을 덮어쓴다.
+DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
+
+# tool_use 이벤트를 텔레그램에 보여줄 사람말로 변환
+TOOL_LABELS = {
+    "Write": "📝 파일 작성",
+    "Edit": "✏️ 파일 수정",
+    "MultiEdit": "✏️ 파일 수정",
+    "Read": "👀 파일 읽기",
+    "Bash": "⚡ 명령 실행",
+    "Glob": "🔍 파일 탐색",
+    "Grep": "🔍 내용 검색",
+    "WebSearch": "🌐 웹 검색",
+    "WebFetch": "🌐 웹 페이지 열기",
+    "TodoWrite": "📋 계획 정리",
+    "Task": "🤖 하위 작업",
+}
+
+
+def describe_tool(name: str, tool_input: dict) -> str:
+    """tool_use 블록을 텔레그램에 보여줄 한 줄로 요약."""
+    label = TOOL_LABELS.get(name, f"🔧 {name}")
+    detail = ""
+    if name in ("Write", "Edit", "MultiEdit", "Read"):
+        detail = os.path.basename(str(tool_input.get("file_path", "")))
+    elif name == "Bash":
+        detail = str(tool_input.get("description") or tool_input.get("command", ""))[:60]
+    elif name in ("Glob", "Grep"):
+        detail = str(tool_input.get("pattern", ""))[:40]
+    elif name in ("WebSearch", "WebFetch"):
+        detail = str(tool_input.get("query") or tool_input.get("url", ""))[:50]
+    return f"{label}: {detail}" if detail else label
+
 def _parse_allowed_user_ids() -> set[int]:
     """ALLOWED_USER_IDS 환경변수를 파싱한다. 잘못된 값이면 즉시 종료 —
     조용히 무시하면 '빈 허용 목록 = 전체 허용'으로 오작동할 수 있다."""
@@ -105,14 +139,22 @@ chat_locks: dict[int, asyncio.Lock] = {}
 
 
 
-async def run_claude(chat_id: int, prompt: str) -> str:
-    """chat_id의 세션으로 claude -p를 실행하고 응답 텍스트를 돌려준다."""
+# 채팅방별 모델 오버라이드 (/model 명령으로 설정)
+chat_models: dict[int, str] = {}
+
+
+async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
+    """chat_id의 세션으로 claude를 스트리밍 실행한다.
+    tool_use가 나올 때마다 on_progress(설명) 콜백을 호출하고, 최종 답변 텍스트를 반환한다.
+    """
     key = str(chat_id)
-    cmd = [CLAUDE_BIN, "-p", "--output-format", "text"]
+    cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose"]
     if CLAUDE_PERMISSION_MODE:
         cmd += ["--permission-mode", CLAUDE_PERMISSION_MODE]
+    model = chat_models.get(chat_id, DEFAULT_MODEL)
+    if model:
+        cmd += ["--model", model]
     # MCP 서버(context7 등)는 cwd(workspace)의 .mcp.json 에서 자동 로드된다.
-    # --mcp-config 플래그는 뒤따르는 프롬프트를 인자로 삼켜버려 쓰지 않는다.
 
     if key in sessions:
         cmd += ["--resume", sessions[key]]
@@ -130,22 +172,43 @@ async def run_claude(chat_id: int, prompt: str) -> str:
         stderr=asyncio.subprocess.PIPE,
         cwd=WORKDIR,
     )
+
+    final_text = ""
+
+    async def read_stream() -> None:
+        nonlocal final_text
+        assert proc.stdout is not None
+        async for raw in proc.stdout:
+            line = raw.decode(errors="replace").strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = event.get("type")
+            if etype == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_use" and on_progress:
+                        await on_progress(describe_tool(block.get("name", ""), block.get("input", {}) or {}))
+            elif etype == "result":
+                final_text = str(event.get("result", "") or "")
+
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_TIMEOUT)
+        await asyncio.wait_for(read_stream(), timeout=CLAUDE_TIMEOUT)
+        await proc.wait()
     except asyncio.TimeoutError:
         proc.kill()
         return "⏰ 응답 시간이 너무 오래 걸려 중단했어요. 다시 시도해 주세요."
 
     if proc.returncode != 0:
-        err = stderr.decode(errors="replace").strip()
-        log.error("claude 실행 실패 (chat=%s): %s", chat_id, err)
-        # 세션이 깨진 경우가 많으므로 리셋해서 다음 메시지는 새 대화로 시작
+        stderr = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
+        log.error("claude 실행 실패 (chat=%s): %s", chat_id, stderr)
         sessions.pop(key, None)
         save_sessions(sessions)
-        return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({err[:200]})"
+        return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({stderr[:200]})"
 
-    text = stdout.decode(errors="replace").strip()
-    return text or "(빈 응답)"
+    return final_text.strip() or "(빈 응답)"
 
 
 def split_message(text: str) -> list[str]:
@@ -168,8 +231,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "안녕하세요! 메시지를 보내면 Claude가 답해드려요.\n"
+        "사진·파일을 보내면 분석하고, 코딩도 실제로 해드려요.\n\n"
         "/new — 대화 초기화\n"
-        f"당신의 유저 ID: {update.effective_user.id}"
+        "/model — 모델 확인·변경 (opus / sonnet)\n"
+        f"\n당신의 유저 ID: {update.effective_user.id}"
     )
 
 
@@ -179,6 +244,27 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sessions.pop(str(update.effective_chat.id), None)
     save_sessions(sessions)
     await update.message.reply_text("🆕 새 대화를 시작합니다.")
+
+
+async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    arg = " ".join(context.args).strip() if context.args else ""
+    if not arg:
+        current = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독)"
+        await update.message.reply_text(
+            f"현재 모델: {current}\n"
+            "바꾸려면: /model opus  또는  /model sonnet\n"
+            "기본값으로: /model default"
+        )
+        return
+    if arg.lower() in ("default", "기본", "reset"):
+        chat_models.pop(chat_id, None)
+        await update.message.reply_text("모델을 기본값으로 되돌렸어요.")
+    else:
+        chat_models[chat_id] = arg
+        await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요. (다음 메시지부터 적용)")
 
 
 async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
@@ -228,7 +314,33 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elif not prompt:
             return  # 내용 없는 메시지는 무시
 
-        reply = await run_claude(chat_id, prompt)
+        # 진행 상황을 보여줄 메시지 하나를 띄우고, 작업이 진행될 때마다 편집한다
+        progress_msg = await update.message.reply_text("🤔 생각 중…")
+        actions: list[str] = []
+        last_edit = 0.0
+
+        async def on_progress(desc: str) -> None:
+            nonlocal last_edit
+            actions.append(desc)
+            now = asyncio.get_event_loop().time()
+            # 텔레그램 편집 제한 대비 최소 1.5초 간격, 최근 6개만 표시
+            if now - last_edit < 1.5:
+                return
+            last_edit = now
+            body = "\n".join(actions[-6:])
+            try:
+                await context.bot.edit_message_text(body, chat_id=chat_id, message_id=progress_msg.message_id)
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass  # 편집 실패(동일 내용 등)는 무시
+
+        reply = await run_claude(chat_id, prompt, on_progress=on_progress)
+
+        # 진행 메시지는 지우고 최종 답변을 새로 보낸다
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=progress_msg.message_id)
+        except Exception:
+            pass
         for chunk in split_message(reply):
             await update.message.reply_text(chunk)
 
@@ -244,6 +356,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("model", cmd_model))
     # 텍스트 + 사진 + 문서 모두 처리
     app.add_handler(MessageHandler(
         (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
