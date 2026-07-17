@@ -370,12 +370,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     workdir = chat_workdirs.get(chat_id, WORKDIR)
     mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
     busy = "작업 중" if chat_id in running_procs else "대기 중"
-    # 서버 부하 (load average)
+    # 절대경로(서버 내부 구조)를 그대로 노출하지 않고 홈 기준 상대경로로 표시
     try:
-        load1, load5, _ = os.getloadavg()
-        load = f"{load1:.2f} / {load5:.2f}"
-    except OSError:
-        load = "N/A"
+        shown_dir = "~/" + str(workdir.relative_to(Path.home()))
+    except ValueError:
+        shown_dir = workdir.name  # 홈 밖이면 폴더 이름만
     await update.message.reply_text(
         f"🤖 봇 상태\n"
         f"- 가동시간: {fmt_uptime(time.time() - START_TIME)}\n"
@@ -383,8 +382,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- 모드: {mode}\n"
         f"- 현재: {busy}\n"
         f"- 저장된 대화: {len(sessions)}개\n"
-        f"- 작업 폴더: {workdir}\n"
-        f"- 서버 부하(1분/5분): {load}"
+        f"- 작업 폴더: {shown_dir}"
     )
 
 
