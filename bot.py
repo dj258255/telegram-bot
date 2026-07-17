@@ -271,6 +271,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/model — 모델 확인·변경 (opus / sonnet)\n"
         "/status — 봇 상태 확인\n"
         "/cd — 작업 폴더 전환\n"
+        "/ls — 현재 폴더 파일 목록\n"
         f"\n당신의 유저 ID: {update.effective_user.id}"
     )
 
@@ -369,7 +370,41 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"그런 폴더가 없어요: {target}")
         return
     chat_workdirs[chat_id] = target
-    await update.message.reply_text(f"작업 폴더를 바꿨어요:\n{target}")
+    await update.message.reply_text(f"작업 폴더를 바꿨어요:\n{target}\n\n/ls 로 내용을 볼 수 있어요.")
+
+
+async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    base = chat_workdirs.get(chat_id, WORKDIR)
+    arg = " ".join(context.args).strip() if context.args else ""
+    target = (base / arg).expanduser() if arg else base
+    if arg and Path(arg).is_absolute():
+        target = Path(arg)
+    if not target.is_dir():
+        await update.message.reply_text(f"그런 폴더가 없어요: {target}")
+        return
+    try:
+        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        await update.message.reply_text(f"폴더를 열 권한이 없어요: {target}")
+        return
+    if not entries:
+        await update.message.reply_text(f"📂 {target}\n(비어 있음)")
+        return
+    lines = []
+    for p in entries[:100]:  # 너무 길면 100개까지만
+        if p.is_dir():
+            lines.append(f"📁 {p.name}/")
+        else:
+            size = p.stat().st_size
+            unit = f"{size}B" if size < 1024 else f"{size // 1024}KB"
+            lines.append(f"📄 {p.name} ({unit})")
+    more = f"\n… 외 {len(entries) - 100}개" if len(entries) > 100 else ""
+    body = f"📂 {target}\n" + "\n".join(lines) + more
+    for chunk in split_message(body):
+        await update.message.reply_text(chunk)
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -495,6 +530,7 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_cd))
+    app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 모두 처리
     app.add_handler(MessageHandler(
