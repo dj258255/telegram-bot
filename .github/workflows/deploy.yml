@@ -1,0 +1,35 @@
+name: Deploy to OCI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # 수동 실행 버튼
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH로 서버 배포
+        env:
+          SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
+          HOST: ${{ secrets.OCI_HOST }}
+          USER: ${{ secrets.OCI_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$USER@$HOST" '
+            set -e
+            cd ~/telegram-bot
+            git fetch origin main
+            git reset --hard origin/main
+            .venv/bin/pip install -q -r requirements.txt
+            sudo systemctl restart claude-bot
+            sleep 6
+            systemctl is-active claude-bot
+            journalctl -u claude-bot --no-pager -n 4 -o cat
+          '

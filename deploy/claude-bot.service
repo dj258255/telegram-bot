@@ -1,0 +1,20 @@
+# OCI 서버(Rocky Linux)에서 봇을 상시 실행하는 systemd 서비스
+# 설치: sudo cp deploy/claude-bot.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now claude-bot
+[Unit]
+Description=Telegram Claude Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rocky
+WorkingDirectory=/home/rocky/telegram-bot
+# 토큰들은 저장소 밖 .env에 (discord-bot과 동일 패턴, git 제외됨)
+EnvironmentFile=/home/rocky/telegram-bot/.env
+ExecStart=/home/rocky/telegram-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# 런타임에 생성되는 파일 — 커밋 금지
+sessions.json
+workspace/
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+docs/DEPLOY-RECORD.local.md
