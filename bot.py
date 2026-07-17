@@ -40,6 +40,9 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 초
 # 채팅 중 /model 명령으로 바꾸면 이 값을 덮어쓴다.
 DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
 
+# 사고 강도(effort). 비우면 Claude 기본(high). low/medium/high/xhigh/max.
+DEFAULT_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
+
 # 음성 메시지 → 텍스트 변환용 Groq API 키 (없으면 음성 기능 비활성)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -172,6 +175,8 @@ def fmt_uptime(seconds: float) -> str:
 
 # 채팅방별 모델 오버라이드 (/model 명령으로 설정)
 chat_models: dict[int, str] = {}
+# 채팅방별 사고 강도 오버라이드 (/effort 명령으로 설정)
+chat_efforts: dict[int, str] = {}
 
 
 async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
@@ -185,6 +190,9 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
     model = chat_models.get(chat_id, DEFAULT_MODEL)
     if model:
         cmd += ["--model", model]
+    effort = chat_efforts.get(chat_id, DEFAULT_EFFORT)
+    if effort:
+        cmd += ["--effort", effort]
     # MCP 서버(context7 등)는 cwd(workspace)의 .mcp.json 에서 자동 로드된다.
 
     if key in sessions:
@@ -269,6 +277,7 @@ def is_allowed(update: Update) -> bool:
 COMMANDS = [
     ("new", "대화 초기화"),
     ("model", "모델 확인·변경 (fable / opus / sonnet)"),
+    ("effort", "사고 강도 (low ~ max)"),
     ("status", "봇 상태 확인"),
     ("cd", "작업 폴더 전환"),
     ("ls", "현재 폴더 파일 목록"),
@@ -343,6 +352,45 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
 
 
+# 사고 강도 단계와 설명
+EFFORT_CHOICES = {
+    "low": "빠름·적은 토큰. 간단한 질문·잡담",
+    "medium": "균형. 보통 작업",
+    "high": "깊게 생각. 복잡한 코딩·추론 (기본)",
+    "xhigh": "더 깊게. 어려운 작업",
+    "max": "최대. 가장 어려운 문제 (느림·토큰 많음)",
+}
+
+
+async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    arg = " ".join(context.args).strip().lower() if context.args else ""
+    if not arg:
+        current = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "기본(high)"
+        menu = "\n".join(f"• {name} — {desc}" for name, desc in EFFORT_CHOICES.items())
+        await update.message.reply_text(
+            f"현재 사고 강도: {current}\n\n"
+            f"단계:\n{menu}\n\n"
+            "바꾸기: /effort low  ·  /effort high  ·  /effort max\n"
+            "기본값으로: /effort default"
+        )
+        return
+    if arg in ("default", "기본", "reset"):
+        chat_efforts.pop(chat_id, None)
+        await update.message.reply_text("사고 강도를 기본값으로 되돌렸어요.")
+    elif arg in EFFORT_CHOICES:
+        chat_efforts[chat_id] = arg
+        await update.message.reply_text(
+            f"사고 강도를 '{arg}'(으)로 설정했어요 — {EFFORT_CHOICES[arg]}. (다음 메시지부터 적용)"
+        )
+    else:
+        await update.message.reply_text(
+            f"'{arg}'는 없는 단계예요. low / medium / high / xhigh / max 중에 골라주세요."
+        )
+
+
 async def transcribe_voice(update: Update) -> str | None:
     """음성/오디오 메시지를 Groq Whisper로 텍스트 변환. 없거나 실패하면 None."""
     msg = update.message
@@ -415,6 +463,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat_id = update.effective_chat.id
     model = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+    effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "기본(high)"
     workdir = chat_workdirs.get(chat_id, WORKDIR)
     mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
     busy = "작업 중" if chat_id in running_procs else "대기 중"
@@ -427,6 +476,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🤖 봇 상태\n"
         f"- 가동시간: {fmt_uptime(time.time() - START_TIME)}\n"
         f"- 모델: {model}\n"
+        f"- 사고 강도: {effort}\n"
         f"- 모드: {mode}\n"
         f"- 현재: {busy}\n"
         f"- 저장된 대화: {len(sessions)}개\n"
@@ -622,6 +672,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("effort", cmd_effort))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("ls", cmd_ls))
