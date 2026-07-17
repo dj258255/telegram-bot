@@ -261,18 +261,40 @@ def is_allowed(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id in ALLOWED_IDS
 
 
+# 명령어 목록 (한 곳에서 관리 — /help, /start, 텔레그램 자동완성 메뉴가 공유)
+COMMANDS = [
+    ("new", "대화 초기화"),
+    ("model", "모델 확인·변경 (fable / opus / sonnet)"),
+    ("status", "봇 상태 확인"),
+    ("cd", "작업 폴더 전환"),
+    ("ls", "현재 폴더 파일 목록"),
+    ("help", "명령어 도움말"),
+]
+
+
+def commands_text() -> str:
+    return "\n".join(f"/{name} — {desc}" for name, desc in COMMANDS)
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     await update.message.reply_text(
         "안녕하세요! 메시지를 보내면 Claude가 답해드려요.\n"
         "사진·파일을 보내면 분석하고, 코딩도 실제로 해드려요.\n\n"
-        "/new — 대화 초기화\n"
-        "/model — 모델 확인·변경 (fable / opus / sonnet)\n"
-        "/status — 봇 상태 확인\n"
-        "/cd — 작업 폴더 전환\n"
-        "/ls — 현재 폴더 파일 목록\n"
+        f"{commands_text()}\n"
         f"\n당신의 유저 ID: {update.effective_user.id}"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    await update.message.reply_text(
+        "📖 명령어\n"
+        f"{commands_text()}\n\n"
+        "그 외엔 그냥 메시지를 보내면 Claude가 답하고, "
+        "사진·파일을 보내면 분석해요. 코딩 모드에선 파일 작성·명령 실행도 합니다."
     )
 
 
@@ -536,8 +558,13 @@ def main() -> None:
     # Python 3.12+ 에서는 메인 스레드에 이벤트 루프가 자동 생성되지 않으므로 직접 만든다
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-    app = Application.builder().token(token).build()
+    # 텔레그램 "/" 자동완성 메뉴에 명령어 등록
+    async def post_init(application: Application) -> None:
+        await application.bot.set_my_commands([(name, desc) for name, desc in COMMANDS])
+
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
