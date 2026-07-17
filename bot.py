@@ -268,7 +268,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "안녕하세요! 메시지를 보내면 Claude가 답해드려요.\n"
         "사진·파일을 보내면 분석하고, 코딩도 실제로 해드려요.\n\n"
         "/new — 대화 초기화\n"
-        "/model — 모델 확인·변경 (opus / sonnet)\n"
+        "/model — 모델 확인·변경 (fable / opus / sonnet)\n"
         "/status — 봇 상태 확인\n"
         "/cd — 작업 폴더 전환\n"
         "/ls — 현재 폴더 파일 목록\n"
@@ -284,16 +284,27 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🆕 새 대화를 시작합니다.")
 
 
+# 고를 수 있는 모델 별칭과 설명
+MODEL_CHOICES = {
+    "fable": "가장 똑똑한 최신 모델 (어려운 작업·긴 코딩). 느리고 사용량 많음",
+    "opus": "고성능. 복잡한 코딩·추론에 강함",
+    "sonnet": "빠르고 균형 잡힘. 일상 작업에 적합 (기본)",
+    "haiku": "가장 빠르고 가벼움. 간단한 질문용",
+}
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
     arg = " ".join(context.args).strip() if context.args else ""
     if not arg:
-        current = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독)"
+        current = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독, 보통 sonnet)"
+        menu = "\n".join(f"• {name} — {desc}" for name, desc in MODEL_CHOICES.items())
         await update.message.reply_text(
-            f"현재 모델: {current}\n"
-            "바꾸려면: /model opus  또는  /model sonnet\n"
+            f"현재 모델: {current}\n\n"
+            f"고를 수 있는 모델:\n{menu}\n\n"
+            "바꾸기: /model fable  ·  /model opus  ·  /model sonnet\n"
             "기본값으로: /model default"
         )
         return
@@ -302,7 +313,8 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("모델을 기본값으로 되돌렸어요.")
     else:
         chat_models[chat_id] = arg
-        await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요. (다음 메시지부터 적용)")
+        note = f" — {MODEL_CHOICES[arg.lower()]}" if arg.lower() in MODEL_CHOICES else ""
+        await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
 
 
 async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
