@@ -655,6 +655,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("실행 중인 작업이 없어요.")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """처리 중 예외가 나도 봇이 멈추지 않게 로그를 남기고 사용자에게 알린다."""
+    log.error("처리 중 예외: %s", context.error, exc_info=context.error)
+    # 실행 중 잠금이 걸려 있으면 사용자 쪽엔 다른 메시지가 나갔을 수 있으니, 조용히 로그만 남기고
+    # 채팅이 특정되면 짧게 알린다.
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ 처리 중 문제가 생겼어요. 다시 시도해 주세요. (문제가 계속되면 /new 로 초기화)",
+            )
+        except Exception:
+            pass
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -663,11 +678,19 @@ def main() -> None:
     # Python 3.12+ 에서는 메인 스레드에 이벤트 루프가 자동 생성되지 않으므로 직접 만든다
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-    # 텔레그램 "/" 자동완성 메뉴에 명령어 등록
+    # 텔레그램 "/" 자동완성 메뉴 등록 + 시작 알림
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([(name, desc) for name, desc in COMMANDS])
+        # 봇이 시작·재시작되면 허용된 사용자에게 알린다. 예상치 못한 알림이 오면 문제 신호.
+        if os.environ.get("STARTUP_NOTIFY", "1") != "0":
+            for uid in ALLOWED_IDS:
+                try:
+                    await application.bot.send_message(chat_id=uid, text="✅ 봇이 시작됐어요.")
+                except Exception:
+                    pass
 
     app = Application.builder().token(token).post_init(post_init).build()
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
