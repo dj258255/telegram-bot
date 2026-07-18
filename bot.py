@@ -34,7 +34,8 @@ logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", le
 log = logging.getLogger("claude-bot")
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "600"))  # 초
+# 응답 대기 한도. fable+xhigh 같은 무거운 설정은 한 작업이 오래 걸리므로 넉넉히 둔다.
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "3600"))  # 초 (기본 1시간)
 
 # 사용 모델. 비우면 구독 기본값(보통 Sonnet). "opus"/"sonnet" 또는 정확한 모델명.
 # 채팅 중 /model 명령으로 바꾸면 이 값을 덮어쓴다.
@@ -622,18 +623,40 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         await refresh("🤔 작업 시작…")
         work_start = asyncio.get_event_loop().time()
+        last_activity = work_start  # 마지막으로 뭔가 일어난 시각 (침묵 감지용)
 
         async def on_progress(desc: str) -> None:
-            nonlocal last_edit
+            nonlocal last_edit, last_activity
             actions.append(desc)
-            now = asyncio.get_event_loop().time()
+            last_activity = asyncio.get_event_loop().time()
+            now = last_activity
             if now - last_edit < 1.5:  # 텔레그램 편집 제한 대비
                 return
             last_edit = now
             await refresh("\n".join(actions[-6:]))
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-        reply = await run_claude(chat_id, prompt, on_progress=on_progress)
+        async def heartbeat() -> None:
+            """진행 신호가 뜸한 동안에도 '살아있음'을 보여준다.
+            타이핑 표시를 유지하고, 오래 조용하면 경과 시간을 알린다."""
+            while True:
+                await asyncio.sleep(9)  # 텔레그램 타이핑 표시는 ~5초라 그 전에 갱신
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                idle = asyncio.get_event_loop().time() - last_activity
+                if idle > 20:  # 20초 넘게 조용하면 경과 시간 표시 (생각 중인 구간)
+                    mins = int((asyncio.get_event_loop().time() - work_start) // 60)
+                    tail = f" ({mins}분 경과)" if mins else ""
+                    body = "\n".join(actions[-5:] + [f"🤔 생각 중…{tail}"]) if actions else f"🤔 생각 중…{tail}"
+                    await refresh(body)
+
+        hb = asyncio.create_task(heartbeat())
+        try:
+            reply = await run_claude(chat_id, prompt, on_progress=on_progress)
+        finally:
+            hb.cancel()
 
         # 진행 메시지 지우고 최종 답변 전송
         try:
