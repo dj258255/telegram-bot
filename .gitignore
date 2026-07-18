@@ -15,5 +15,5 @@ venv/
 docs/DEPLOY-RECORD.local.md
 !workspace/.claude/
 !workspace/.claude/**
-!workspace/prompts/
-!workspace/prompts/**
+# 개인 프롬프트는 공개 저장소에 두지 않는다 (GitHub Secrets로 관리)
+workspace/prompts/

@@ -18,18 +18,27 @@ jobs:
           SSH_KEY: ${{ secrets.OCI_SSH_KEY }}
           HOST: ${{ secrets.OCI_HOST }}
           USER: ${{ secrets.OCI_USER }}
+          # 개인 프롬프트는 공개 저장소에 두지 않고 시크릿에서 서버로 내려준다
+          PROMPT_DE_AI: ${{ secrets.PROMPT_DE_AI_WRITING }}
+          PROMPT_RESUME: ${{ secrets.PROMPT_RESUME_REVIEW }}
         run: |
           mkdir -p ~/.ssh
           echo "$SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$USER@$HOST" '
+          # 멀티라인 프롬프트를 base64로 인코딩해 안전하게 전송 (인용/개행 문제 회피)
+          DE_AI_B64=$(printf '%s' "$PROMPT_DE_AI" | base64 | tr -d '\n')
+          RESUME_B64=$(printf '%s' "$PROMPT_RESUME" | base64 | tr -d '\n')
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$USER@$HOST" "
             set -e
             cd ~/telegram-bot
             git fetch origin main
             git reset --hard origin/main
+            mkdir -p workspace/prompts
+            echo '$DE_AI_B64' | base64 -d > workspace/prompts/de-ai-writing-prompt.md
+            echo '$RESUME_B64' | base64 -d > workspace/prompts/resume-review-master-prompt.md
             .venv/bin/pip install -q -r requirements.txt
             sudo systemctl restart claude-bot
             sleep 6
             systemctl is-active claude-bot
             journalctl -u claude-bot --no-pager -n 4 -o cat
-          '
+          "
