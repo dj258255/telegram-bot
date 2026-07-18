@@ -1,0 +1,59 @@
+# 봇 서버에 설치할 Claude Code 플러그인 목록 (맥 설정에서 복제).
+# 형식: 플러그인이름@마켓플레이스   (# 로 시작하면 주석)
+# 마켓플레이스는 setup.sh 가 먼저 등록한다.
+
+# --- 공식 마켓플레이스 (anthropics/claude-plugins-official) ---
+frontend-design@claude-plugins-official
+context7@claude-plugins-official
+claude-md-management@claude-plugins-official
+code-review@claude-plugins-official
+feature-dev@claude-plugins-official
+code-simplifier@claude-plugins-official
+typescript-lsp@claude-plugins-official
+playwright@claude-plugins-official
+commit-commands@claude-plugins-official
+serena@claude-plugins-official
+security-guidance@claude-plugins-official
+pr-review-toolkit@claude-plugins-official
+pyright-lsp@claude-plugins-official
+figma@claude-plugins-official
+supabase@claude-plugins-official
+atlassian@claude-plugins-official
+plugin-dev@claude-plugins-official
+explanatory-output-style@claude-plugins-official
+greptile@claude-plugins-official
+claude-code-setup@claude-plugins-official
+Notion@claude-plugins-official
+hookify@claude-plugins-official
+linear@claude-plugins-official
+vercel@claude-plugins-official
+learning-output-style@claude-plugins-official
+slack@claude-plugins-official
+sentry@claude-plugins-official
+gopls-lsp@claude-plugins-official
+csharp-lsp@claude-plugins-official
+gitlab@claude-plugins-official
+rust-analyzer-lsp@claude-plugins-official
+stripe@claude-plugins-official
+laravel-boost@claude-plugins-official
+php-lsp@claude-plugins-official
+jdtls-lsp@claude-plugins-official
+playground@claude-plugins-official
+clangd-lsp@claude-plugins-official
+swift-lsp@claude-plugins-official
+firebase@claude-plugins-official
+huggingface-skills@claude-plugins-official
+kotlin-lsp@claude-plugins-official
+lua-lsp@claude-plugins-official
+coderabbit@claude-plugins-official
+asana@claude-plugins-official
+circleback@claude-plugins-official
+pinecone@claude-plugins-official
+posthog@claude-plugins-official
+firecrawl@claude-plugins-official
+sonatype-guide@claude-plugins-official
+
+# --- 비공식 마켓플레이스 ---
+humanize-korean@im-not-ai
+claude-hud@claude-hud
+warp@claude-code-warp

@@ -1,0 +1,5 @@
+# 등록할 플러그인 마켓플레이스 (github 저장소). setup.sh 가 plugins.txt 설치 전에 추가한다.
+anthropics/claude-plugins-official
+epoko77-ai/im-not-ai
+jarrodwatts/claude-hud
+warpdotdev/claude-code-warp

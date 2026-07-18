@@ -15,3 +15,5 @@ venv/
 docs/DEPLOY-RECORD.local.md
 !workspace/.claude/
 !workspace/.claude/**
+!workspace/prompts/
+!workspace/prompts/**
