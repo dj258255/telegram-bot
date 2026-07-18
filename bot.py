@@ -38,12 +38,20 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # 응답 대기 한도. fable+xhigh 같은 무거운 설정은 한 작업이 오래 걸리므로 넉넉히 둔다.
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "3600"))  # 초 (기본 1시간)
 
-# 사용 모델. 비우면 구독 기본값(보통 Sonnet). "opus"/"sonnet" 또는 정확한 모델명.
-# 채팅 중 /model 명령으로 바꾸면 이 값을 덮어쓴다.
-DEFAULT_MODEL = os.environ.get("CLAUDE_MODEL", "").strip()
+# 기본 모델·강도는 코드에 박아둔다 (git으로 배포되므로 env 파일과 무관하게 따라감).
+# 환경변수로 덮어쓸 수 있고, 채팅 중 /model·/effort 로도 바꾼다.
+# 값을 비우고 싶으면(구독 기본값) 환경변수에 "default" 를 넣는다.
+def _env_default(key: str, fallback: str) -> str:
+    v = os.environ.get(key)
+    if v is None:  # 환경변수 자체가 없으면 코드 기본값
+        return fallback
+    v = v.strip()
+    if v.lower() in ("default", "기본"):  # 명시적으로 구독 기본값을 원하면 비움
+        return ""
+    return v or fallback  # 빈 문자열이면 코드 기본값
 
-# 사고 강도(effort). 비우면 Claude 기본(high). low/medium/high/xhigh/max.
-DEFAULT_EFFORT = os.environ.get("CLAUDE_EFFORT", "").strip()
+DEFAULT_MODEL = _env_default("CLAUDE_MODEL", "opus")
+DEFAULT_EFFORT = _env_default("CLAUDE_EFFORT", "max")
 
 # 음성 메시지 → 텍스트 변환용 Groq API 키 (없으면 음성 기능 비활성)
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
