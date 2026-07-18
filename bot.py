@@ -640,9 +640,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except Exception:
             pass
-        # 30초 넘게 걸린 긴 작업이면 완료 표시를 앞에 붙여 눈에 띄게
+        # 30초 넘게 걸린 긴 작업이 "성공"했을 때만 완료 표시를 붙인다.
+        # 타임아웃·중단·실패 메시지(⏰🛑⚠️로 시작)엔 붙이지 않는다.
         elapsed = asyncio.get_event_loop().time() - work_start
-        prefix = "✅ 완료!\n\n" if elapsed > 30 else ""
+        is_error = reply.startswith(("⏰", "🛑", "⚠️"))
+        prefix = "✅ 완료!\n\n" if (elapsed > 30 and not is_error) else ""
         chunks = split_message(prefix + reply)
         for chunk in chunks:
             await update.message.reply_text(chunk)
