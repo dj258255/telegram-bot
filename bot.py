@@ -827,7 +827,15 @@ def main() -> None:
                 except Exception:
                     pass
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    # concurrent_updates=True: 긴 작업이 도는 중에도 중단 버튼 콜백을 즉시 처리한다.
+    # (기본값 False면 업데이트를 하나씩 처리해서, 작업이 끝나야 중단 버튼이 먹힌다.)
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
