@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 import uuid
 from pathlib import Path
@@ -152,6 +153,18 @@ def _sync_busy_marker() -> None:
         pass
 
 
+def kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    """claude 프로세스와 그 자식·손자까지 프로세스 그룹째로 죽인다.
+    (claude가 띄운 bash·빌드 명령이 살아남아 파이프를 잡고 있는 걸 막는다.)"""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()  # 그룹 죽이기가 안 되면 최소한 본체라도
+        except ProcessLookupError:
+            pass
+
+
 def load_sessions() -> dict[str, str]:
     if SESSIONS_FILE.exists():
         try:
@@ -170,6 +183,11 @@ chat_locks: dict[int, asyncio.Lock] = {}
 START_TIME = time.time()
 # 채팅방별 작업 디렉터리 오버라이드 (/cd 명령). 기본은 WORKDIR.
 chat_workdirs: dict[int, Path] = {}
+# 채팅방별 "수정 파일 첨부 전송" 켜짐 여부 (/files 명령). 기본 켜짐.
+send_files_on: dict[int, bool] = {}
+# 첨부로 보낼 파일 상한 (너무 많거나 큰 파일로 도배 방지)
+MAX_FILES_SEND = 10
+MAX_FILE_BYTES = 1_000_000  # 1MB
 
 
 def fmt_uptime(seconds: float) -> str:
@@ -194,7 +212,7 @@ chat_models: dict[int, str] = {}
 chat_efforts: dict[int, str] = {}
 
 
-async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
+async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files: set | None = None) -> str:
     """chat_id의 세션으로 claude를 스트리밍 실행한다.
     tool_use가 나올 때마다 on_progress(설명) 콜백을 호출하고, 최종 답변 텍스트를 반환한다.
     """
@@ -226,11 +244,13 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=str(workdir),
+        start_new_session=True,  # 별도 프로세스 그룹 → 중단 시 자식까지 한 번에 정리
     )
     running_procs[chat_id] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
     _sync_busy_marker()  # 작업 중 표시 → 배포가 이걸 보고 재시작을 미룬다
 
     final_text = ""
+    agents: dict[str, int] = {}  # Task 도구 tool_use_id → 하위 에이전트 번호
 
     async def read_stream() -> None:
         nonlocal final_text
@@ -244,10 +264,30 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
             except json.JSONDecodeError:
                 continue
             etype = event.get("type")
+            # 하위 에이전트가 낸 이벤트는 parent_tool_use_id 로 어느 에이전트인지 구분된다
+            parent_id = event.get("parent_tool_use_id")
             if etype == "assistant":
                 for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "tool_use" and on_progress:
-                        await on_progress(describe_tool(block.get("name", ""), block.get("input", {}) or {}))
+                    if block.get("type") != "tool_use" or not on_progress:
+                        continue
+                    name = block.get("name", "")
+                    tinput = block.get("input", {}) or {}
+                    # 만들거나 고친 파일 경로를 수집 (작업 끝나고 첨부로 보내기 위해)
+                    if name in ("Write", "Edit", "MultiEdit") and touched_files is not None:
+                        fp = tinput.get("file_path")
+                        if fp:
+                            touched_files.add(str(fp))
+                    if name == "Task":
+                        # 새 하위 에이전트 생성 — 번호를 매겨 구분
+                        n = len(agents) + 1
+                        agents[block.get("id", "")] = n
+                        label = tinput.get("description") or tinput.get("subagent_type") or "하위 작업"
+                        await on_progress(f"🤖 에이전트 {n} 시작: {label}")
+                    elif parent_id in agents:
+                        # 특정 하위 에이전트의 도구 사용 → "에이전트 N · ..." 로 표시
+                        await on_progress(f"🤖 {agents[parent_id]} · {describe_tool(name, tinput)}")
+                    else:
+                        await on_progress(describe_tool(name, tinput))
             elif etype == "result":
                 final_text = str(event.get("result", "") or "")
 
@@ -255,7 +295,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
         await asyncio.wait_for(read_stream(), timeout=CLAUDE_TIMEOUT)
         await proc.wait()
     except asyncio.TimeoutError:
-        proc.kill()
+        kill_process_group(proc)
         return "⏰ 응답 시간이 너무 오래 걸려 중단했어요. 다시 시도해 주세요."
     finally:
         running_procs.pop(chat_id, None)
@@ -298,6 +338,7 @@ COMMANDS = [
     ("status", "봇 상태 확인"),
     ("cd", "작업 폴더 전환"),
     ("ls", "현재 폴더 파일 목록"),
+    ("files", "수정한 파일 첨부 전송 on/off"),
     ("help", "명령어 도움말"),
 ]
 
@@ -612,11 +653,15 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         actions: list[str] = []
         last_edit = 0.0
         stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 중단", callback_data="stop")]])
+        # 진행 메시지 최상단에 현재 모델·강도를 표시
+        cur_model = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+        cur_effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "high"
+        header = f"현재 모델: {cur_model} · 강도 {cur_effort}\n\n"
 
         async def refresh(text: str) -> None:
             try:
                 await context.bot.edit_message_text(
-                    text, chat_id=chat_id, message_id=status_msg.message_id, reply_markup=stop_kb,
+                    header + text, chat_id=chat_id, message_id=status_msg.message_id, reply_markup=stop_kb,
                 )
             except Exception:
                 pass
@@ -652,9 +697,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                     body = "\n".join(actions[-5:] + [f"🤔 생각 중…{tail}"]) if actions else f"🤔 생각 중…{tail}"
                     await refresh(body)
 
+        touched: set[str] = set()
         hb = asyncio.create_task(heartbeat())
         try:
-            reply = await run_claude(chat_id, prompt, on_progress=on_progress)
+            reply = await run_claude(chat_id, prompt, on_progress=on_progress, touched_files=touched)
         finally:
             hb.cancel()
 
@@ -671,6 +717,53 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chunks = split_message(prefix + reply)
         for chunk in chunks:
             await update.message.reply_text(chunk)
+
+        # 수정·생성한 파일을 첨부로 보낸다 (끄려면 /files off)
+        if touched and not is_error and send_files_on.get(chat_id, True):
+            await send_touched_files(update, context, touched)
+
+
+async def send_touched_files(update: Update, context: ContextTypes.DEFAULT_TYPE, paths: set[str]) -> None:
+    """작업 중 만들거나 고친 파일을 첨부로 보낸다. 작업 폴더 안, 크기·개수 제한."""
+    chat_id = update.effective_chat.id
+    base = chat_workdirs.get(chat_id, WORKDIR).resolve()
+    sent = 0
+    skipped = 0
+    for p in sorted(paths):
+        if sent >= MAX_FILES_SEND:
+            skipped += 1
+            continue
+        try:
+            fp = Path(p).resolve()
+            # 작업 폴더 밖 파일은 보내지 않는다 (안전)
+            if not fp.is_relative_to(base) or not fp.is_file():
+                continue
+            if fp.stat().st_size > MAX_FILE_BYTES:
+                await update.message.reply_text(f"📎 {fp.name} 은 너무 커서 첨부를 건너뛰었어요.")
+                continue
+            with open(fp, "rb") as f:
+                await context.bot.send_document(chat_id=chat_id, document=f, filename=fp.name)
+            sent += 1
+        except Exception as e:
+            log.warning("파일 첨부 실패 %s: %s", p, e)
+    if skipped:
+        await update.message.reply_text(f"📎 파일이 많아 {sent}개만 보냈어요. (나머지 {skipped}개 생략)")
+
+
+async def cmd_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    arg = " ".join(context.args).strip().lower() if context.args else ""
+    if arg in ("on", "켜", "켜기"):
+        send_files_on[chat_id] = True
+        await update.message.reply_text("📎 수정한 파일을 첨부로 보냅니다.")
+    elif arg in ("off", "꺼", "끄기"):
+        send_files_on[chat_id] = False
+        await update.message.reply_text("📎 파일 첨부를 끕니다.")
+    else:
+        state = "켜짐" if send_files_on.get(chat_id, True) else "꺼짐"
+        await update.message.reply_text(f"📎 파일 첨부: {state}\n바꾸기: /files on  또는  /files off")
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -690,8 +783,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "stop":
         proc = running_procs.get(chat_id)
         if proc:
-            proc.kill()
-            await query.answer("중단하는 중…")
+            kill_process_group(proc)  # 자식·손자까지 그룹째 죽여 즉시 멈춘다
+            await query.answer("중단했어요.")
         else:
             await query.answer("실행 중인 작업이 없어요.")
 
@@ -744,6 +837,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("ls", cmd_ls))
+    app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 + 음성/오디오 모두 처리
     app.add_handler(MessageHandler(
