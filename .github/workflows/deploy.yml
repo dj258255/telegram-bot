@@ -37,6 +37,11 @@ jobs:
             echo '$DE_AI_B64' | base64 -d > workspace/prompts/de-ai-writing-prompt.md
             echo '$RESUME_B64' | base64 -d > workspace/prompts/resume-review-master-prompt.md
             .venv/bin/pip install -q -r requirements.txt
+            # 작업 중이면(.busy 존재) 끝날 때까지 최대 5분 기다렸다가 재시작 (진행 중 작업이 끊기지 않게)
+            for i in \$(seq 1 60); do
+              [ -f workspace/.busy ] || break
+              echo \"작업 중… 재시작 대기 (\$i/60)\"; sleep 5
+            done
             sudo systemctl restart claude-bot
             sleep 6
             systemctl is-active claude-bot

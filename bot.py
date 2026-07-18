@@ -136,6 +136,20 @@ running_procs: dict[int, asyncio.subprocess.Process] = {}
 # 시작 전 대기 중 취소 신호
 pending_cancel: dict[int, asyncio.Event] = {}
 
+# 작업 중 표시 파일. 배포 스크립트가 이 파일이 사라질 때까지 재시작을 미룬다.
+BUSY_MARKER = WORKDIR / ".busy"
+
+
+def _sync_busy_marker() -> None:
+    """실행 중인 작업이 있으면 표시 파일을 만들고, 없으면 지운다."""
+    try:
+        if running_procs:
+            BUSY_MARKER.touch()
+        elif BUSY_MARKER.exists():
+            BUSY_MARKER.unlink()
+    except OSError:
+        pass
+
 
 def load_sessions() -> dict[str, str]:
     if SESSIONS_FILE.exists():
@@ -213,6 +227,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
         cwd=str(workdir),
     )
     running_procs[chat_id] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
+    _sync_busy_marker()  # 작업 중 표시 → 배포가 이걸 보고 재시작을 미룬다
 
     final_text = ""
 
@@ -243,6 +258,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None) -> str:
         return "⏰ 응답 시간이 너무 오래 걸려 중단했어요. 다시 시도해 주세요."
     finally:
         running_procs.pop(chat_id, None)
+        _sync_busy_marker()  # 남은 작업이 없으면 표시 제거
 
     # 중단 버튼으로 죽인 경우 (kill → 음수 리턴코드)
     if proc.returncode and proc.returncode < 0:
@@ -677,6 +693,10 @@ def main() -> None:
 
     # Python 3.12+ 에서는 메인 스레드에 이벤트 루프가 자동 생성되지 않으므로 직접 만든다
     asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # 시작 시엔 실행 중인 작업이 없으므로 남아 있던 작업 표시를 지운다 (강제 종료 대비)
+    running_procs.clear()
+    _sync_busy_marker()
 
     # 텔레그램 "/" 자동완성 메뉴 등록 + 시작 알림
     async def post_init(application: Application) -> None:
