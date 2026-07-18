@@ -46,35 +46,30 @@ export ALLOWED_USER_IDS="내_유저_ID"
 서버 주소·계정·키 실제 값은 `docs/DEPLOY-RECORD.local.md` 참고 (git 제외).
 현재 운영: balruno 서버(SERVER_IP)에 systemd로 상시 가동.
 
-### 최초 1회 셋업
+### 최초 1회 셋업 — 서버 옮겨도 이 순서면 끝 (자동화됨)
 
 ```bash
-# PTB 22.x는 Python 3.10+ 필요 (Rocky 9 기본 3.9로는 안 됨)
-sudo dnf install -y python3.12 git nodejs npm
-sudo npm install -g @anthropic-ai/claude-code
-
-# 비공개 저장소 → 서버에 deploy key 등록 후
+# 1) 비공개 저장소 clone (서버에 deploy key 등록 후)
 git clone git@github.com-telegram:dj258255/telegram-bot.git ~/telegram-bot
 cd ~/telegram-bot
-python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
 
-# 환경변수 — SELinux 때문에 /etc 에 둔다 (홈 디렉터리는 systemd가 못 읽음)
-sudo cp .env.example /etc/claude-bot.env && sudo nano /etc/claude-bot.env
-sudo chmod 600 /etc/claude-bot.env && sudo restorecon /etc/claude-bot.env
+# 2) 원클릭 구축 — 시스템 패키지·Claude CLI·venv·systemd·sudoers 자동
+bash deploy/setup.sh
 
-# systemd 등록
-sudo cp deploy/claude-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now claude-bot
+# 3) 토큰 채우기
+sudo nano /etc/claude-bot.env
+#   TELEGRAM_BOT_TOKEN / ALLOWED_USER_IDS / CLAUDE_CODE_OAUTH_TOKEN / GROQ_API_KEY
+
+# 4) 토큰 넣은 뒤 재실행하면 플러그인 52개 + 마켓플레이스까지 자동 설치
+bash deploy/setup.sh
+
+# 5) 시작
+sudo systemctl restart claude-bot && systemctl status claude-bot
 ```
 
-`CLAUDE_CODE_OAUTH_TOKEN`은 **맥에서** `claude setup-token`(브라우저 로그인)으로 발급해 `/etc/claude-bot.env`에 넣는다.
-
-GitHub Actions 재시작 허용:
-```bash
-echo "rocky ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart claude-bot" | sudo tee /etc/sudoers.d/claude-bot
-```
+- `CLAUDE_CODE_OAUTH_TOKEN`은 **맥에서** `claude setup-token`(브라우저 로그인)으로 발급.
+- 설치할 플러그인/마켓플레이스 목록은 `deploy/plugins.txt` / `deploy/marketplaces.txt` (git 관리 → 서버 옮겨도 동일 재현).
+- `setup.sh`는 여러 번 실행해도 안전(idempotent).
 
 ### 코드 수정 후 배포 (이게 전부)
 
