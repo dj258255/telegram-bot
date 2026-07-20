@@ -37,6 +37,8 @@ from telegram.ext import (
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("claude-bot")
+# httpx가 INFO로 요청 URL(텔레그램 봇 토큰 포함)을 로그에 찍는 걸 막는다 (토큰 노출 방지)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # 응답 대기 한도. fable+xhigh 같은 무거운 설정은 한 작업이 오래 걸리므로 넉넉히 둔다.
@@ -676,15 +678,16 @@ _limit_cache: dict = {"at": 0.0, "data": None, "error": None}
 
 
 def _oauth_token() -> str | None:
-    """구독 인증 토큰. systemd env(CLAUDE_CODE_OAUTH_TOKEN) 우선, 없으면 Claude 크레덴셜 파일."""
-    tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
-    if tok:
-        return tok
+    """구독 한도 조회용 토큰. 인터랙티브 `claude login`의 access token(user:profile scope 보유)을
+    우선 쓰고, 없으면 setup-token(env)으로 폴백한다. setup-token은 scope가 부족해 403이 날 수 있다."""
     try:
         d = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
-        return (d.get("claudeAiOauth") or {}).get("accessToken")
+        tok = (d.get("claudeAiOauth") or {}).get("accessToken")
+        if tok:
+            return tok
     except Exception:
-        return None
+        pass
+    return (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip() or None
 
 
 def fetch_subscription_limits() -> dict:
@@ -731,7 +734,12 @@ async def subscription_limits_text() -> str:
             _limit_cache["error"] = None
         except urllib.error.HTTPError as e:
             _limit_cache["data"] = None
-            _limit_cache["error"] = f"HTTP {e.code}" + (" 요청과다" if e.code == 429 else "")
+            if e.code == 403:
+                _limit_cache["error"] = "권한 부족 — 서버에서 'claude login' 필요 (setup-token엔 user:profile scope 없음)"
+            elif e.code == 429:
+                _limit_cache["error"] = "요청 과다(429) — 잠시 후 다시"
+            else:
+                _limit_cache["error"] = f"HTTP {e.code}"
         except Exception as e:
             _limit_cache["data"] = None
             _limit_cache["error"] = "토큰 없음" if str(e) == "no-token" else type(e).__name__
