@@ -17,7 +17,10 @@ import logging
 import os
 import signal
 import time
+import urllib.error
+import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -415,7 +418,7 @@ COMMANDS = [
     ("model", "모델 확인·변경 (fable / opus / sonnet / haiku)"),
     ("effort", "사고 강도 (low ~ max)"),
     ("status", "봇 상태 확인"),
-    ("usage", "토큰·비용 사용량"),
+    ("usage", "토큰 사용량 (구독 기준)"),
     ("session", "대화 세션 여러 개 관리·전환"),
     ("cd", "작업 폴더 전환"),
     ("ls", "현재 폴더 파일 목록"),
@@ -666,23 +669,104 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("사용법: /session [list | new 이름 | switch 이름 | delete 이름]")
 
 
+# --- 구독 한도 조회 (비공식 /api/oauth/usage — 실패해도 봇은 정상 동작) ---
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+USAGE_LIMIT_TTL = 120  # 초 — 이 엔드포인트가 429가 잦아 캐시해서 가끔만 부른다
+_limit_cache: dict = {"at": 0.0, "data": None, "error": None}
+
+
+def _oauth_token() -> str | None:
+    """구독 인증 토큰. systemd env(CLAUDE_CODE_OAUTH_TOKEN) 우선, 없으면 Claude 크레덴셜 파일."""
+    tok = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    if tok:
+        return tok
+    try:
+        d = json.loads((Path.home() / ".claude" / ".credentials.json").read_text())
+        return (d.get("claudeAiOauth") or {}).get("accessToken")
+    except Exception:
+        return None
+
+
+def fetch_subscription_limits() -> dict:
+    """비공식 /api/oauth/usage 호출 → 5시간·주간 사용률 JSON. (블로킹 — to_thread로 부른다)
+    User-Agent 헤더 필수(없으면 429 폭탄). 실패는 호출부에서 처리."""
+    tok = _oauth_token()
+    if not tok:
+        raise RuntimeError("no-token")
+    req = urllib.request.Request(OAUTH_USAGE_URL, headers={
+        "Authorization": f"Bearer {tok}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "claude-code/2.1.212",
+        "Content-Type": "application/json",
+    })
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def _fmt_reset(iso: str) -> str:
+    """ISO8601(UTC) 리셋 시각 → 'MM/DD HH:MM KST'."""
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(timezone(timedelta(hours=9)))
+        return dt.strftime("%m/%d %H:%M") + " KST"
+    except Exception:
+        return (iso or "?")[:16]
+
+
+def format_limit_line(label: str, window: dict | None) -> str | None:
+    """한 창(5시간/주간)의 남은 여유를 한 줄로. 데이터 없으면 None. (테스트용 순수 함수)"""
+    if not window or window.get("utilization") is None:
+        return None
+    used = float(window["utilization"])
+    remaining = max(0.0, 100.0 - used)
+    return f"- {label}: {remaining:.0f}% 남음 (사용 {used:.0f}% · 리셋 {_fmt_reset(window.get('resets_at', ''))})"
+
+
+async def subscription_limits_text() -> str:
+    """구독 한도를 사람이 볼 문자열로. 캐시 + 실패 시 사유만 안내(봇은 안 죽음)."""
+    now = time.time()
+    if now - _limit_cache["at"] > USAGE_LIMIT_TTL:
+        _limit_cache["at"] = now  # 성공/실패 무관하게 백오프 (429 방지)
+        try:
+            _limit_cache["data"] = await asyncio.to_thread(fetch_subscription_limits)
+            _limit_cache["error"] = None
+        except urllib.error.HTTPError as e:
+            _limit_cache["data"] = None
+            _limit_cache["error"] = f"HTTP {e.code}" + (" 요청과다" if e.code == 429 else "")
+        except Exception as e:
+            _limit_cache["data"] = None
+            _limit_cache["error"] = "토큰 없음" if str(e) == "no-token" else type(e).__name__
+    data = _limit_cache["data"]
+    if not data:
+        return f"구독 한도: 조회 실패 ({_limit_cache['error'] or '알 수 없음'})"
+    parts = []
+    for label, key in (("5시간", "five_hour"), ("주간(전체)", "seven_day"), ("주간(Sonnet)", "seven_day_sonnet")):
+        line = format_limit_line(label, data.get(key))
+        if line:
+            parts.append(line)
+    return "구독 한도 (남은 여유)\n" + ("\n".join(parts) if parts else "(데이터 없음)")
+
+
 async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
+    limits = await subscription_limits_text()
     acc = usage_totals.get(update.effective_chat.id)
-    if not acc:
-        await update.message.reply_text(
-            "아직 사용 기록이 없어요. (봇 재시작 이후 이 채팅에서 주고받은 것부터 집계돼요)"
+    if acc:
+        body = (
+            "📊 토큰 사용량 (봇 시작 이후 · 이 채팅)\n"
+            f"- 요청: {acc.get('turns', 0)}회\n"
+            f"- 입력 토큰: {acc.get('input', 0):,}\n"
+            f"- 출력 토큰: {acc.get('output', 0):,}\n"
+            f"- 캐시 읽기 토큰: {acc.get('cache_read', 0):,}\n"
+            f"- API 환산가(참고): ${acc.get('cost', 0.0):.4f}"
         )
-        return
+    else:
+        body = "📊 토큰 사용량 — 이 채팅은 아직 주고받은 기록이 없어요."
     await update.message.reply_text(
-        "📊 사용량 (봇 시작 이후 · 이 채팅 기준)\n"
-        f"- 요청: {acc.get('turns', 0)}회\n"
-        f"- 입력 토큰: {acc.get('input', 0):,}\n"
-        f"- 출력 토큰: {acc.get('output', 0):,}\n"
-        f"- 캐시 읽기 토큰: {acc.get('cache_read', 0):,}\n"
-        f"- 누적 비용(추정): ${acc.get('cost', 0.0):.4f}\n\n"
-        "※ 구독 잔여 한도(%)는 API로 제공되지 않아 표시 못 해요. 위는 claude가 응답에 보고한 토큰·비용 집계예요."
+        f"🟢 {limits}\n\n"
+        f"{body}\n\n"
+        "※ 환산가는 구독이라 실제 청구가 아니라 'API로 썼다면' 참고치예요.\n"
+        "※ 구독 한도는 비공식 경로라 부정확·지연될 수 있어요."
     )
 
 

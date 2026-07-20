@@ -163,5 +163,20 @@ class SessionListFormatTest(unittest.TestCase):
         self.assertNotIn("새 대화", base_line)          # 세션 있음
 
 
+class LimitFormatTest(unittest.TestCase):
+    def test_remaining_computed(self):
+        line = bot.format_limit_line("5시간", {"utilization": 33.0, "resets_at": "2026-04-11T07:00:00+00:00"})
+        self.assertIn("67% 남음", line)
+        self.assertIn("사용 33%", line)
+
+    def test_none_when_no_data(self):
+        self.assertIsNone(bot.format_limit_line("주간", None))
+        self.assertIsNone(bot.format_limit_line("주간", {"utilization": None}))
+
+    def test_reset_converted_to_kst(self):
+        # 07:00 UTC + 9h = 16:00 KST
+        self.assertEqual(bot._fmt_reset("2026-04-11T07:00:00+00:00"), "04/11 16:00 KST")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
