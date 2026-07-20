@@ -31,12 +31,17 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new "$USER@$HOST" "
             set -e
             cd ~/telegram-bot
+            PREV=\$(git rev-parse HEAD)
             git fetch origin main
             git reset --hard origin/main
             mkdir -p workspace/prompts
             echo '$DE_AI_B64' | base64 -d > workspace/prompts/de-ai-writing-prompt.md
             echo '$RESUME_B64' | base64 -d > workspace/prompts/resume-review-master-prompt.md
             .venv/bin/pip install -q -r requirements.txt
+            # 새 코드 문법 검사 — 깨졌으면 이전 커밋으로 되돌리고 중단 (라이브 봇이 크래시 루프에 안 빠지게)
+            .venv/bin/python -m py_compile bot.py || { echo '❌ bot.py 문법 오류 — 이전 커밋 유지, 배포 중단'; git reset --hard \$PREV; exit 1; }
+            # 유닛테스트 — 로직 회귀가 있으면 이전 커밋으로 되돌리고 중단
+            .venv/bin/python -m unittest discover -s tests -t . || { echo '❌ 테스트 실패 — 이전 커밋 유지, 배포 중단'; git reset --hard \$PREV; exit 1; }
             # 작업 중이면(.busy 존재) 끝날 때까지 최대 5분 기다렸다가 재시작 (진행 중 작업이 끊기지 않게)
             for i in \$(seq 1 60); do
               [ -f workspace/.busy ] || break
@@ -44,6 +49,7 @@ jobs:
             done
             sudo systemctl restart claude-bot
             sleep 6
-            systemctl is-active claude-bot
+            # 기동 실패면 이전 커밋으로 자동 롤백 (라이브 봇을 살려둔다)
+            systemctl is-active --quiet claude-bot || { echo '❌ 기동 실패 — 이전 커밋으로 롤백'; git reset --hard \$PREV; sudo systemctl restart claude-bot; sleep 6; systemctl is-active claude-bot; exit 1; }
             journalctl -u claude-bot --no-pager -n 4 -o cat
           "

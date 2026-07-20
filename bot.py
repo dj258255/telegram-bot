@@ -18,6 +18,7 @@ import os
 import signal
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -196,6 +197,10 @@ send_files_on: dict[int, bool] = {}
 # 첨부로 보낼 파일 상한 (너무 많거나 큰 파일로 도배 방지)
 MAX_FILES_SEND = 10
 MAX_FILE_BYTES = 1_000_000  # 1MB
+# 답장(reply) 맥락으로 붙이는 인용문 최대 길이 (긴 답변에 답장해도 프롬프트가 안 터지게)
+REPLY_QUOTE_LIMIT = 1500
+# 이 길이를 넘는 답변은 텍스트 조각과 함께 .md 파일로도 첨부 (긴 답변 저장·가독성)
+LONG_ANSWER_LIMIT = 6000
 
 
 def fmt_uptime(seconds: float) -> str:
@@ -332,6 +337,17 @@ def split_message(text: str) -> list[str]:
     return chunks
 
 
+def build_prompt_with_reply(prompt: str, replied_text: str | None) -> str:
+    """텔레그램 '답장(reply)' 대상 메시지가 있으면 인용으로 맥락을 붙인다.
+    길면 잘라내고, 인용이 비어 있으면 원문 그대로 둔다. (테스트를 위해 순수 함수로 분리)"""
+    quoted = (replied_text or "").strip()
+    if not quoted:
+        return prompt
+    if len(quoted) > REPLY_QUOTE_LIMIT:
+        quoted = quoted[:REPLY_QUOTE_LIMIT] + " …(생략)"
+    return f"[사용자가 이 메시지에 답장함]\n> {quoted}\n\n{prompt}".strip()
+
+
 def is_allowed(update: Update) -> bool:
     if not ALLOWED_IDS:
         return True  # 허용 목록이 비어 있으면 전체 허용 (이때 코딩 모드는 자동 꺼짐)
@@ -341,7 +357,7 @@ def is_allowed(update: Update) -> bool:
 # 명령어 목록 (한 곳에서 관리 — /help, /start, 텔레그램 자동완성 메뉴가 공유)
 COMMANDS = [
     ("new", "대화 초기화"),
-    ("model", "모델 확인·변경 (fable / opus / sonnet)"),
+    ("model", "모델 확인·변경 (fable / opus / sonnet / haiku)"),
     ("effort", "사고 강도 (low ~ max)"),
     ("status", "봇 상태 확인"),
     ("cd", "작업 폴더 전환"),
@@ -405,7 +421,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             f"현재 모델: {current}\n\n"
             f"고를 수 있는 모델:\n{menu}\n\n"
-            "바꾸기: /model fable  ·  /model opus  ·  /model sonnet\n"
+            "바꾸기: /model opus  ·  /model sonnet  ·  /model haiku  ·  /model fable\n"
             "기본값으로: /model default"
         )
         return
@@ -603,6 +619,16 @@ async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(chunk)
 
 
+async def send_answer_file(update: Update, text: str) -> None:
+    """긴 답변을 .md 파일로도 첨부한다 (텍스트 조각과 별개로 저장·가독성용). 디스크 안 씀."""
+    try:
+        bio = BytesIO(text.encode("utf-8"))
+        bio.name = f"답변_{update.message.message_id}.md"
+        await update.message.reply_document(document=bio)
+    except Exception:
+        pass  # 첨부 실패해도 본문은 이미 전송됨
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         log.info("허용되지 않은 사용자 차단: %s", update.effective_user.id if update.effective_user else "?")
@@ -633,6 +659,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             prompt = f"{note}\n{prompt}" if prompt else f"{note}\n이 파일을 확인하고 설명해 주세요."
         elif not prompt:
             return  # 내용 없는 메시지는 무시
+
+        # 텔레그램 '답장(reply)'으로 보냈으면, 답장 대상 메시지를 맥락으로 붙인다.
+        # (봇의 이전 답변이든 내 메시지든 — 세션 히스토리 중 '어느 것에 대한 얘기인지' 짚어준다)
+        replied = update.message.reply_to_message
+        if replied:
+            prompt = build_prompt_with_reply(prompt, replied.text or replied.caption)
 
         # 코딩 모드면 실행 전 잠깐 취소 기회를 준다 (잘못 보낸 명령 방어)
         status_msg = await update.message.reply_text("🤔 생각 중…")
@@ -725,6 +757,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         chunks = split_message(prefix + reply)
         for chunk in chunks:
             await update.message.reply_text(chunk)
+
+        # 긴 답변은 .md 파일로도 첨부 (저장·가독성)
+        if not is_error and len(reply) > LONG_ANSWER_LIMIT:
+            await send_answer_file(update, reply)
 
         # 수정·생성한 파일을 첨부로 보낸다 (끄려면 /files off)
         if touched and not is_error and send_files_on.get(chat_id, True):
