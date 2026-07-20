@@ -124,5 +124,44 @@ class ReplyContextTest(unittest.TestCase):
         self.assertLess(len(out), len(long) + 100)  # 상한 근처로 잘림
 
 
+class AccumulateUsageTest(unittest.TestCase):
+    def test_sums_across_calls(self):
+        acc = {}
+        bot.accumulate_usage(acc, {
+            "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 3},
+            "total_cost_usd": 0.01,
+        })
+        bot.accumulate_usage(acc, {"usage": {"input_tokens": 20, "output_tokens": 7}, "total_cost_usd": 0.02})
+        self.assertEqual(acc["input"], 30)
+        self.assertEqual(acc["output"], 12)
+        self.assertEqual(acc["cache_read"], 3)
+        self.assertEqual(acc["turns"], 2)
+        self.assertAlmostEqual(acc["cost"], 0.03)
+
+    def test_missing_usage_is_safe(self):
+        acc = {}
+        bot.accumulate_usage(acc, {})  # usage/cost 없어도 안 터지고 turns만 증가
+        self.assertEqual(acc["turns"], 1)
+        self.assertEqual(acc["input"], 0)
+        self.assertAlmostEqual(acc["cost"], 0.0)
+
+
+class SessionListFormatTest(unittest.TestCase):
+    def test_empty_shows_default_as_new(self):
+        out = bot.format_session_lines({"active": "기본", "names": {}})
+        self.assertIn("기본", out)
+        self.assertIn("새 대화", out)
+
+    def test_active_marked_and_unused_flagged(self):
+        entry = {"active": "결제", "names": {"기본": "sid-1", "결제": None}}
+        out = bot.format_session_lines(entry)
+        base_line = next(l for l in out.splitlines() if "기본" in l)
+        pay_line = next(l for l in out.splitlines() if "결제" in l)
+        self.assertTrue(pay_line.startswith("▶"))      # 활성 표시
+        self.assertIn("새 대화", pay_line)              # 세션 없음
+        self.assertFalse(base_line.startswith("▶"))     # 비활성
+        self.assertNotIn("새 대화", base_line)          # 세션 있음
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

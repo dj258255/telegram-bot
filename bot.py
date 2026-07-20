@@ -129,6 +129,9 @@ MCP_CONFIG = WORKDIR / ".mcp.json"
 
 # 채팅방별 세션 ID를 저장해서 봇을 재시작해도 대화가 이어지게 함
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+# 다중세션: 채팅방별 '이름 붙인 대화 스레드' 메타(활성 이름 + 이름→세션id). sessions.json은
+# 그대로(활성 세션 id) 두어 구버전·롤백과 호환한다. 이 파일은 신버전만 읽고 구버전은 무시.
+THREADS_FILE = Path(__file__).parent / "threads.json"
 
 # 텔레그램에 어울리는 답변 스타일. 취향대로 수정하세요.
 SYSTEM_PROMPT = (
@@ -146,6 +149,8 @@ CANCEL_DELAY = int(os.environ.get("CANCEL_DELAY", "4"))
 running_procs: dict[int, asyncio.subprocess.Process] = {}
 # 시작 전 대기 중 취소 신호
 pending_cancel: dict[int, asyncio.Event] = {}
+# 채팅방별 누적 토큰·비용 (claude 응답이 보고한 값). 인메모리 — 봇 재시작 시 초기화. /usage 로 확인
+usage_totals: dict[int, dict] = {}
 
 # 작업 중 표시 파일. 배포 스크립트가 이 파일이 사라질 때까지 재시작을 미룬다.
 BUSY_MARKER = WORKDIR / ".busy"
@@ -187,7 +192,37 @@ def save_sessions(sessions: dict[str, str]) -> None:
     SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
 
 
+def load_threads() -> dict:
+    if THREADS_FILE.exists():
+        try:
+            return json.loads(THREADS_FILE.read_text())
+        except json.JSONDecodeError:
+            log.warning("threads.json 파싱 실패 — 새로 시작합니다")
+    return {}
+
+
+def save_threads(t: dict) -> None:
+    THREADS_FILE.write_text(json.dumps(t, ensure_ascii=False, indent=2))
+
+
+DEFAULT_THREAD = "기본"
+
+
+def format_session_lines(entry: dict) -> str:
+    """스레드 목록을 사람이 볼 문자열로. 활성엔 ▶, 아직 대화 없는 스레드엔 (새 대화). (테스트용 순수 함수)"""
+    active = entry.get("active") or DEFAULT_THREAD
+    names = entry.get("names") or {}
+    if not names:
+        return f"▶ {active} (새 대화)"
+    lines = []
+    for n, sid in names.items():
+        mark = "▶ " if n == active else "   "
+        lines.append(f"{mark}{n}{'' if sid else ' (새 대화)'}")
+    return "\n".join(lines)
+
+
 sessions = load_sessions()
+chat_threads = load_threads()
 chat_locks: dict[int, asyncio.Lock] = {}
 START_TIME = time.time()
 # 채팅방별 작업 디렉터리 오버라이드 (/cd 명령). 기본은 WORKDIR.
@@ -247,6 +282,10 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         session_id = str(uuid.uuid4())
         sessions[key] = session_id
         save_sessions(sessions)
+        # 다중세션: 새로 만든 세션 id를 현재 활성 스레드에 기록
+        entry = chat_threads.setdefault(key, {"active": DEFAULT_THREAD, "names": {}})
+        entry["names"][entry.get("active") or DEFAULT_THREAD] = session_id
+        save_threads(chat_threads)
         cmd += ["--session-id", session_id, "--system-prompt", SYSTEM_PROMPT]
 
     cmd.append(prompt)
@@ -303,6 +342,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
                         await on_progress(describe_tool(name, tinput))
             elif etype == "result":
                 final_text = str(event.get("result", "") or "")
+                accumulate_usage(usage_totals.setdefault(chat_id, {}), event)
 
     try:
         await asyncio.wait_for(read_stream(), timeout=CLAUDE_TIMEOUT)
@@ -323,6 +363,10 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         log.error("claude 실행 실패 (chat=%s): %s", chat_id, stderr)
         sessions.pop(key, None)
         save_sessions(sessions)
+        entry = chat_threads.get(key)
+        if entry and entry.get("names"):
+            entry["names"][entry.get("active") or DEFAULT_THREAD] = None
+            save_threads(chat_threads)
         return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({stderr[:200]})"
 
     return final_text.strip() or "(빈 응답)"
@@ -348,6 +392,17 @@ def build_prompt_with_reply(prompt: str, replied_text: str | None) -> str:
     return f"[사용자가 이 메시지에 답장함]\n> {quoted}\n\n{prompt}".strip()
 
 
+def accumulate_usage(acc: dict, event: dict) -> dict:
+    """claude 'result' 이벤트의 usage/비용을 누적 딕셔너리에 더한다. 필드가 없어도 안전. (테스트용 분리)"""
+    u = event.get("usage") or {}
+    acc["input"] = acc.get("input", 0) + int(u.get("input_tokens", 0) or 0)
+    acc["output"] = acc.get("output", 0) + int(u.get("output_tokens", 0) or 0)
+    acc["cache_read"] = acc.get("cache_read", 0) + int(u.get("cache_read_input_tokens", 0) or 0)
+    acc["cost"] = acc.get("cost", 0.0) + float(event.get("total_cost_usd", 0) or 0)
+    acc["turns"] = acc.get("turns", 0) + 1
+    return acc
+
+
 def is_allowed(update: Update) -> bool:
     if not ALLOWED_IDS:
         return True  # 허용 목록이 비어 있으면 전체 허용 (이때 코딩 모드는 자동 꺼짐)
@@ -360,6 +415,8 @@ COMMANDS = [
     ("model", "모델 확인·변경 (fable / opus / sonnet / haiku)"),
     ("effort", "사고 강도 (low ~ max)"),
     ("status", "봇 상태 확인"),
+    ("usage", "토큰·비용 사용량"),
+    ("session", "대화 세션 여러 개 관리·전환"),
     ("cd", "작업 폴더 전환"),
     ("ls", "현재 폴더 파일 목록"),
     ("files", "수정한 파일 첨부 전송 on/off"),
@@ -396,8 +453,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    sessions.pop(str(update.effective_chat.id), None)
+    key = str(update.effective_chat.id)
+    sessions.pop(key, None)
     save_sessions(sessions)
+    # 현재 활성 스레드의 대화만 초기화 (다른 스레드는 유지)
+    entry = chat_threads.get(key)
+    if entry and entry.get("names"):
+        entry["names"][entry.get("active") or DEFAULT_THREAD] = None
+        save_threads(chat_threads)
     await update.message.reply_text("🆕 새 대화를 시작합니다.")
 
 
@@ -538,6 +601,89 @@ async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await tg_file.download_to_drive(custom_path=str(dest))
     log.info("첨부 저장: %s", dest)
     return str(dest)
+
+
+async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """다중세션: 한 채팅 안에서 이름 붙인 대화 스레드를 만들고 전환한다."""
+    if not is_allowed(update):
+        return
+    key = str(update.effective_chat.id)
+    entry = chat_threads.setdefault(key, {"active": DEFAULT_THREAD, "names": {}})
+    # 초기 상태(스레드 기록 없음)면 진행 중 세션을 '기본' 스레드로 흡수
+    if (entry.get("active") or DEFAULT_THREAD) not in entry["names"]:
+        entry["names"][entry.get("active") or DEFAULT_THREAD] = sessions.get(key)
+    args = context.args or []
+    sub = args[0].lower() if args else "list"
+    name = " ".join(args[1:]).strip()
+
+    if sub in ("list", "ls", "목록"):
+        await update.message.reply_text(
+            "🧵 대화 세션\n" + format_session_lines(entry) +
+            "\n\n새로: /session new 이름 · 전환: /session switch 이름 · 삭제: /session delete 이름"
+        )
+        return
+    if sub in ("new", "create", "새로"):
+        if not name:
+            await update.message.reply_text("세션 이름을 적어줘. 예: /session new 결제")
+            return
+        entry["names"].setdefault(name, None)
+        entry["active"] = name
+        sessions.pop(key, None)  # 첫 메시지에서 새 세션 생성
+        save_sessions(sessions)
+        save_threads(chat_threads)
+        await update.message.reply_text(f"🧵 '{name}' 세션을 만들고 전환했어요. 다음 메시지부터 새 맥락이에요.")
+        return
+    if sub in ("switch", "use", "전환"):
+        if name not in entry["names"]:
+            await update.message.reply_text(f"'{name}' 세션이 없어요. /session list 로 확인해줘.")
+            return
+        entry["active"] = name
+        sid = entry["names"].get(name)
+        if sid:
+            sessions[key] = sid
+        else:
+            sessions.pop(key, None)
+        save_sessions(sessions)
+        save_threads(chat_threads)
+        await update.message.reply_text(f"🧵 '{name}' 세션으로 전환했어요.")
+        return
+    if sub in ("delete", "del", "rm", "삭제"):
+        if name not in entry["names"]:
+            await update.message.reply_text(f"'{name}' 세션이 없어요.")
+            return
+        entry["names"].pop(name, None)
+        if (entry.get("active") or DEFAULT_THREAD) == name:  # 활성 스레드를 지웠으면 다른 스레드로
+            entry["active"] = next(iter(entry["names"]), DEFAULT_THREAD)
+            sid = entry["names"].get(entry["active"])
+            if sid:
+                sessions[key] = sid
+            else:
+                sessions.pop(key, None)
+        save_sessions(sessions)
+        save_threads(chat_threads)
+        await update.message.reply_text(f"🧵 '{name}' 세션을 삭제했어요. 현재: '{entry.get('active')}'")
+        return
+    await update.message.reply_text("사용법: /session [list | new 이름 | switch 이름 | delete 이름]")
+
+
+async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    acc = usage_totals.get(update.effective_chat.id)
+    if not acc:
+        await update.message.reply_text(
+            "아직 사용 기록이 없어요. (봇 재시작 이후 이 채팅에서 주고받은 것부터 집계돼요)"
+        )
+        return
+    await update.message.reply_text(
+        "📊 사용량 (봇 시작 이후 · 이 채팅 기준)\n"
+        f"- 요청: {acc.get('turns', 0)}회\n"
+        f"- 입력 토큰: {acc.get('input', 0):,}\n"
+        f"- 출력 토큰: {acc.get('output', 0):,}\n"
+        f"- 캐시 읽기 토큰: {acc.get('cache_read', 0):,}\n"
+        f"- 누적 비용(추정): ${acc.get('cost', 0.0):.4f}\n\n"
+        "※ 구독 잔여 한도(%)는 API로 제공되지 않아 표시 못 해요. 위는 claude가 응답에 보고한 토큰·비용 집계예요."
+    )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -887,6 +1033,8 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("effort", cmd_effort))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("usage", cmd_usage))
+    app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CommandHandler("files", cmd_files))
