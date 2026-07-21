@@ -1238,17 +1238,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
-def main() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN 환경변수를 설정해 주세요. (@BotFather 에서 발급)")
-
-    # Python 3.12+ 에서는 메인 스레드에 이벤트 루프가 자동 생성되지 않으므로 직접 만든다
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-    # 시작 시엔 실행 중인 작업이 없으므로 남아 있던 작업 표시를 지운다 (강제 종료 대비)
-    running_procs.clear()
-    _sync_busy_marker()
+def build_application(token: str) -> Application:
+    """텔레그램 Application을 만들고 모든 핸들러를 등록해 반환한다.
+    (main에서 분리 — 배선을 오프라인 스모크 테스트로 검증하기 위함)"""
 
     # 텔레그램 "/" 자동완성 메뉴 등록 + 시작 알림
     async def post_init(application: Application) -> None:
@@ -1306,6 +1298,22 @@ def main() -> None:
         on_message,
     ))
 
+    return app
+
+
+def main() -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN 환경변수를 설정해 주세요. (@BotFather 에서 발급)")
+
+    # Python 3.12+ 에서는 메인 스레드에 이벤트 루프가 자동 생성되지 않으므로 직접 만든다
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # 시작 시엔 실행 중인 작업이 없으므로 남아 있던 작업 표시를 지운다 (강제 종료 대비)
+    running_procs.clear()
+    _sync_busy_marker()
+
+    app = build_application(token)
     log.info("봇 시작! (작업 폴더: %s)", WORKDIR)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

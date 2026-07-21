@@ -211,5 +211,27 @@ class ParseDurationTest(unittest.TestCase):
             self.assertIsNone(bot.parse_duration_seconds(bad))
 
 
+class WiringSmokeTest(unittest.TestCase):
+    """배선(핸들러 등록) 회귀 방지 — 앱을 오프라인으로 만들어 모든 명령이 붙었는지 확인."""
+
+    def test_all_command_handlers_registered(self):
+        from telegram.ext import CommandHandler
+
+        app = bot.build_application("123456:DUMMYtokenDUMMYtokenDUMMYtoken1234")
+        handlers = app.handlers[0]
+        cmds = set()
+        for h in handlers:
+            if isinstance(h, CommandHandler):
+                cmds |= set(getattr(h, "commands", []))
+        expected = {
+            "start", "help", "new", "model", "effort", "status", "usage",
+            "session", "cd", "ls", "files", "export", "remind",
+        }
+        missing = expected - cmds
+        self.assertEqual(missing, set(), f"핸들러 누락: {missing}")
+        # COMMANDS 메뉴 목록과 실제 등록된 명령이 일치하는지도(참고)
+        self.assertTrue({n for n, _ in bot.COMMANDS}.issubset(cmds))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
