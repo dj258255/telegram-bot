@@ -233,5 +233,18 @@ class WiringSmokeTest(unittest.TestCase):
         self.assertTrue({n for n, _ in bot.COMMANDS}.issubset(cmds))
 
 
+class AtomicWriteTest(unittest.TestCase):
+    def test_writes_and_leaves_no_tmp(self):
+        import tempfile
+        from pathlib import Path as _P
+
+        p = _P(tempfile.mkdtemp()) / "state.json"
+        bot._atomic_write(p, '{"a": 1}')
+        self.assertEqual(p.read_text(), '{"a": 1}')
+        self.assertFalse(p.with_name(p.name + ".tmp").exists())  # temp 파일 안 남음
+        bot._atomic_write(p, '{"a": 2}')  # 덮어쓰기도 원자적
+        self.assertEqual(p.read_text(), '{"a": 2}')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

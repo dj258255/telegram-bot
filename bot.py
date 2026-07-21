@@ -139,6 +139,8 @@ SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 THREADS_FILE = Path(__file__).parent / "threads.json"
 # 리마인더(/remind): 배포로 재시작돼도 안 날아가게 파일에 저장하고 시작 시 복원한다.
 REMINDERS_FILE = Path(__file__).parent / "reminders.json"
+# 실행 중인 리마인더 태스크 참조 — asyncio가 태스크를 약한참조만 들어 GC하는 걸 막는다.
+_reminder_tasks: set = set()
 
 # 텔레그램에 어울리는 답변 스타일. 취향대로 수정하세요.
 SYSTEM_PROMPT = (
@@ -186,6 +188,30 @@ def kill_process_group(proc: asyncio.subprocess.Process) -> None:
             pass
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    """temp 파일에 쓰고 rename — 쓰는 중 죽어도 원본이 반쯤 덮여 깨지지 않게(원자적)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def prune_uploads(max_age_days: int = 7) -> int:
+    """uploads/의 오래된 첨부를 지워 디스크 무한 증가를 막는다. 지운 개수 반환."""
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    try:
+        for p in UPLOADS_DIR.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return removed
+
+
 def load_sessions() -> dict[str, str]:
     if SESSIONS_FILE.exists():
         try:
@@ -196,7 +222,7 @@ def load_sessions() -> dict[str, str]:
 
 
 def save_sessions(sessions: dict[str, str]) -> None:
-    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2))
+    _atomic_write(SESSIONS_FILE, json.dumps(sessions, indent=2))
 
 
 def load_threads() -> dict:
@@ -209,7 +235,7 @@ def load_threads() -> dict:
 
 
 def save_threads(t: dict) -> None:
-    THREADS_FILE.write_text(json.dumps(t, ensure_ascii=False, indent=2))
+    _atomic_write(THREADS_FILE, json.dumps(t, ensure_ascii=False, indent=2))
 
 
 def load_reminders() -> dict:
@@ -224,7 +250,7 @@ def load_reminders() -> dict:
 
 
 def save_reminders() -> None:
-    REMINDERS_FILE.write_text(json.dumps(reminders, ensure_ascii=False, indent=2))
+    _atomic_write(REMINDERS_FILE, json.dumps(reminders, ensure_ascii=False, indent=2))
 
 
 def parse_duration_seconds(s: str) -> int | None:
@@ -253,7 +279,9 @@ def schedule_reminder(app, item: dict) -> None:
         reminders["items"] = [r for r in reminders["items"] if r["id"] != item["id"]]
         save_reminders()
 
-    asyncio.create_task(_fire())
+    task = asyncio.create_task(_fire())
+    _reminder_tasks.add(task)  # GC로 태스크가 사라지지 않게 참조 보관
+    task.add_done_callback(_reminder_tasks.discard)
 
 
 DEFAULT_THREAD = "기본"
@@ -651,6 +679,7 @@ async def save_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not tg_file:
         return None
 
+    prune_uploads()  # 오래된 첨부 정리(디스크 무한 증가 방지)
     dest = UPLOADS_DIR / filename
     await tg_file.download_to_drive(custom_path=str(dest))
     log.info("첨부 저장: %s", dest)
@@ -1245,6 +1274,7 @@ def build_application(token: str) -> Application:
     # 텔레그램 "/" 자동완성 메뉴 등록 + 시작 알림
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([(name, desc) for name, desc in COMMANDS])
+        prune_uploads()  # 시작 시 오래된 첨부 정리
         # 예약된 리마인더 복원 — 지난 건 지금 발송, 남은 건 다시 스케줄 (재시작에도 안 날아가게)
         now = time.time()
         for item in list(reminders["items"]):
