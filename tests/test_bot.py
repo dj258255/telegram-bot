@@ -196,5 +196,20 @@ class TranscriptExportTest(unittest.TestCase):
         self.assertIsNone(bot.build_transcript_md("no-such-session-xyz", bot.WORKDIR))
 
 
+class ParseDurationTest(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(bot.parse_duration_seconds("30s"), 30)
+        self.assertEqual(bot.parse_duration_seconds("10m"), 600)
+        self.assertEqual(bot.parse_duration_seconds("2h"), 7200)
+        self.assertEqual(bot.parse_duration_seconds("1d"), 86400)
+
+    def test_bare_number_is_minutes(self):
+        self.assertEqual(bot.parse_duration_seconds("45"), 45 * 60)
+
+    def test_invalid(self):
+        for bad in ("", "abc", "10x", "m10", None):
+            self.assertIsNone(bot.parse_duration_seconds(bad))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

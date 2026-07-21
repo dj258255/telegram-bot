@@ -137,6 +137,8 @@ SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 # 다중세션: 채팅방별 '이름 붙인 대화 스레드' 메타(활성 이름 + 이름→세션id). sessions.json은
 # 그대로(활성 세션 id) 두어 구버전·롤백과 호환한다. 이 파일은 신버전만 읽고 구버전은 무시.
 THREADS_FILE = Path(__file__).parent / "threads.json"
+# 리마인더(/remind): 배포로 재시작돼도 안 날아가게 파일에 저장하고 시작 시 복원한다.
+REMINDERS_FILE = Path(__file__).parent / "reminders.json"
 
 # 텔레그램에 어울리는 답변 스타일. 취향대로 수정하세요.
 SYSTEM_PROMPT = (
@@ -210,6 +212,50 @@ def save_threads(t: dict) -> None:
     THREADS_FILE.write_text(json.dumps(t, ensure_ascii=False, indent=2))
 
 
+def load_reminders() -> dict:
+    if REMINDERS_FILE.exists():
+        try:
+            d = json.loads(REMINDERS_FILE.read_text())
+            if isinstance(d, dict) and "items" in d:
+                return d
+        except json.JSONDecodeError:
+            log.warning("reminders.json 파싱 실패 — 새로 시작합니다")
+    return {"seq": 0, "items": []}
+
+
+def save_reminders() -> None:
+    REMINDERS_FILE.write_text(json.dumps(reminders, ensure_ascii=False, indent=2))
+
+
+def parse_duration_seconds(s: str) -> int | None:
+    """'30s'·'10m'·'2h'·'1d'·'45'(단위 없으면 분) → 초. 잘못되면 None. (테스트용 순수 함수)"""
+    s = (s or "").strip().lower()
+    if not s:
+        return None
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if s[-1] in units and s[:-1].isdigit():
+        return int(s[:-1]) * units[s[-1]]
+    if s.isdigit():
+        return int(s) * 60
+    return None
+
+
+def schedule_reminder(app, item: dict) -> None:
+    """due(epoch) 시각에 알림을 보내고 목록에서 지우는 비동기 태스크를 건다."""
+    async def _fire():
+        delay = item["due"] - time.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        try:
+            await app.bot.send_message(chat_id=item["chat_id"], text=f"⏰ 알림: {item['text']}")
+        except Exception:
+            pass
+        reminders["items"] = [r for r in reminders["items"] if r["id"] != item["id"]]
+        save_reminders()
+
+    asyncio.create_task(_fire())
+
+
 DEFAULT_THREAD = "기본"
 
 
@@ -228,6 +274,7 @@ def format_session_lines(entry: dict) -> str:
 
 sessions = load_sessions()
 chat_threads = load_threads()
+reminders = load_reminders()
 chat_locks: dict[int, asyncio.Lock] = {}
 START_TIME = time.time()
 # 채팅방별 작업 디렉터리 오버라이드 (/cd 명령). 기본은 WORKDIR.
@@ -426,6 +473,7 @@ COMMANDS = [
     ("ls", "현재 폴더 파일 목록"),
     ("files", "수정한 파일 첨부 전송 on/off"),
     ("export", "현재 세션 대화 내보내기(.md)"),
+    ("remind", "리마인더 예약 (예: /remind 10m 커피)"),
     ("help", "명령어 도움말"),
 ]
 
@@ -837,6 +885,51 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_document(document=bio, caption="현재 세션 대화 내보내기")
 
 
+async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    mine = [r for r in reminders["items"] if r["chat_id"] == chat_id]
+
+    if not args or args[0].lower() in ("list", "목록"):
+        if not mine:
+            await update.message.reply_text("예약된 리마인더가 없어요.\n예: /remind 10m 커피 마시기")
+            return
+        now = time.time()
+        lines = [f"- id {r['id']}: {r['text']} ({fmt_uptime(max(0, r['due'] - now))} 남음)" for r in mine]
+        await update.message.reply_text(
+            "⏰ 예약된 리마인더\n" + "\n".join(lines) + "\n\n취소: /remind cancel <id>"
+        )
+        return
+
+    if args[0].lower() in ("cancel", "취소") and len(args) >= 2 and args[1].isdigit():
+        rid = int(args[1])
+        before = len(reminders["items"])
+        reminders["items"] = [
+            r for r in reminders["items"] if not (r["id"] == rid and r["chat_id"] == chat_id)
+        ]
+        save_reminders()
+        await update.message.reply_text(
+            f"id {rid} 리마인더를 취소했어요." if len(reminders["items"]) < before else f"id {rid} 리마인더가 없어요."
+        )
+        return
+
+    secs = parse_duration_seconds(args[0])
+    if secs is None:
+        await update.message.reply_text(
+            "시간 형식: 30s · 10m · 2h · 1d · 숫자(분)\n예: /remind 10m 커피 마시기"
+        )
+        return
+    text = " ".join(args[1:]).strip() or "(알림)"
+    reminders["seq"] += 1
+    item = {"id": reminders["seq"], "chat_id": chat_id, "due": time.time() + secs, "text": text}
+    reminders["items"].append(item)
+    save_reminders()
+    schedule_reminder(context.application, item)
+    await update.message.reply_text(f"⏰ {fmt_uptime(secs)} 뒤 알림 예약: {text} (id {item['id']})")
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -1160,6 +1253,20 @@ def main() -> None:
     # 텔레그램 "/" 자동완성 메뉴 등록 + 시작 알림
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([(name, desc) for name, desc in COMMANDS])
+        # 예약된 리마인더 복원 — 지난 건 지금 발송, 남은 건 다시 스케줄 (재시작에도 안 날아가게)
+        now = time.time()
+        for item in list(reminders["items"]):
+            if item["due"] <= now:
+                try:
+                    await application.bot.send_message(
+                        chat_id=item["chat_id"], text=f"⏰ (지난) 알림: {item['text']}"
+                    )
+                except Exception:
+                    pass
+                reminders["items"] = [r for r in reminders["items"] if r["id"] != item["id"]]
+            else:
+                schedule_reminder(application, item)
+        save_reminders()
         # 봇이 시작·재시작되면 허용된 사용자에게 알린다. 예상치 못한 알림이 오면 문제 신호.
         if os.environ.get("STARTUP_NOTIFY", "1") != "0":
             for uid in ALLOWED_IDS:
@@ -1190,6 +1297,7 @@ def main() -> None:
     app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CommandHandler("files", cmd_files))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("remind", cmd_remind))
     app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 + 음성/오디오 모두 처리
     app.add_handler(MessageHandler(
