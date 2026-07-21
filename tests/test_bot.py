@@ -178,5 +178,23 @@ class LimitFormatTest(unittest.TestCase):
         self.assertEqual(bot._fmt_reset("2026-04-11T07:00:00+00:00"), "04/11 16:00 KST")
 
 
+class TranscriptExportTest(unittest.TestCase):
+    def test_blocks_text_from_string(self):
+        self.assertEqual(bot._blocks_text("안녕"), "안녕")
+
+    def test_blocks_text_only_text_blocks(self):
+        content = [
+            {"type": "thinking", "text": "속으로"},
+            {"type": "text", "text": "답1"},
+            {"type": "tool_use", "name": "Bash"},
+            {"type": "text", "text": "답2"},
+        ]
+        self.assertEqual(bot._blocks_text(content), "답1\n답2")
+
+    def test_build_transcript_missing_file_returns_none(self):
+        # 존재하지 않는 세션 id → None (안 터짐)
+        self.assertIsNone(bot.build_transcript_md("no-such-session-xyz", bot.WORKDIR))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

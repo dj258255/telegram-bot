@@ -425,6 +425,7 @@ COMMANDS = [
     ("cd", "작업 폴더 전환"),
     ("ls", "현재 폴더 파일 목록"),
     ("files", "수정한 파일 첨부 전송 on/off"),
+    ("export", "현재 세션 대화 내보내기(.md)"),
     ("help", "명령어 도움말"),
 ]
 
@@ -776,6 +777,64 @@ async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "※ 환산가는 구독이라 실제 청구가 아니라 'API로 썼다면' 참고치예요.\n"
         "※ 구독 한도는 비공식 경로라 부정확·지연될 수 있어요."
     )
+
+
+def _project_dir_for(workdir: Path) -> Path:
+    """Claude Code는 cwd 절대경로의 '/'를 '-'로 바꿔 트랜스크립트 프로젝트 폴더명으로 쓴다."""
+    return Path.home() / ".claude" / "projects" / str(workdir.resolve()).replace("/", "-")
+
+
+def _blocks_text(content) -> str:
+    """트랜스크립트 메시지 content(문자열 또는 블록 리스트)에서 텍스트만 뽑는다. (테스트용 순수 함수)"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+def build_transcript_md(session_id: str, workdir: Path) -> str | None:
+    """claude 트랜스크립트(jsonl)에서 user/assistant 텍스트만 뽑아 마크다운으로. 없으면 None."""
+    f = _project_dir_for(workdir) / f"{session_id}.jsonl"
+    if not f.exists():
+        return None
+    out = []
+    for raw in f.read_text(errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") not in ("user", "assistant"):
+            continue
+        text = _blocks_text((ev.get("message") or {}).get("content")).strip()
+        if not text:
+            continue
+        who = "## 🧑 나" if ev["type"] == "user" else "## 🤖 Claude"
+        out.append(f"{who}\n\n{text}\n")
+    return ("# 대화 내보내기\n\n" + "\n".join(out)) if out else None
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    chat_id = update.effective_chat.id
+    sid = sessions.get(str(chat_id))
+    if not sid:
+        await update.message.reply_text("내보낼 대화가 없어요. (이 세션에서 아직 주고받은 게 없음)")
+        return
+    workdir = chat_workdirs.get(chat_id, WORKDIR)
+    md = await asyncio.to_thread(build_transcript_md, sid, workdir)
+    if not md:
+        await update.message.reply_text("대화 기록 파일을 찾지 못했어요.")
+        return
+    bio = BytesIO(md.encode("utf-8"))
+    bio.name = f"대화_{update.message.message_id}.md"
+    await update.message.reply_document(document=bio, caption="현재 세션 대화 내보내기")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1130,6 +1189,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CommandHandler("files", cmd_files))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CallbackQueryHandler(on_button))
     # 텍스트 + 사진 + 문서 + 음성/오디오 모두 처리
     app.add_handler(MessageHandler(
