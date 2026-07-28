@@ -449,7 +449,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
             save_threads(chat_threads)
         return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({stderr[:200]})"
 
-    return final_text.strip() or "(빈 응답)"
+    return final_text.strip()  # 빈 응답이면 "" → 호출부가 자동 이어가기로 처리
 
 
 def split_message(text: str) -> list[str]:
@@ -554,6 +554,15 @@ MODEL_CHOICES = {
     "haiku": "가장 빠르고 가벼움. 간단한 질문용",
 }
 
+# 버전 고정용 별칭 → 실제 모델 ID. (opus/sonnet 같은 alias는 '그 계열 최신'으로 구독이 해석)
+MODEL_ALIASES = {
+    "opus4.8": "claude-opus-4-8", "opus-4.8": "claude-opus-4-8",
+    "opus4.7": "claude-opus-4-7", "opus-4.7": "claude-opus-4-7",
+    "sonnet5": "claude-sonnet-5", "sonnet-5": "claude-sonnet-5",
+    "haiku4.5": "claude-haiku-4-5-20251001",
+    "fable5": "claude-fable-5",
+}
+
 
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
@@ -567,6 +576,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"현재 모델: {current}\n\n"
             f"고를 수 있는 모델:\n{menu}\n\n"
             "바꾸기: /model opus  ·  /model sonnet  ·  /model haiku  ·  /model fable\n"
+            "버전 고정: /model opus-4.8 · /model opus-4.7 · /model sonnet-5 (또는 정확한 ID)\n"
             "기본값으로: /model default"
         )
         return
@@ -574,9 +584,11 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         chat_models.pop(chat_id, None)
         await update.message.reply_text("모델을 기본값으로 되돌렸어요.")
     else:
-        chat_models[chat_id] = arg
+        model = MODEL_ALIASES.get(arg.lower(), arg)  # opus-4.8 같은 단축은 실제 ID로
+        chat_models[chat_id] = model
         note = f" — {MODEL_CHOICES[arg.lower()]}" if arg.lower() in MODEL_CHOICES else ""
-        await update.message.reply_text(f"모델을 '{arg}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
+        shown = model if model == arg else f"{arg} → {model}"
+        await update.message.reply_text(f"모델을 '{shown}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
 
 
 # 사고 강도 단계와 설명
@@ -1160,8 +1172,19 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         hb = asyncio.create_task(heartbeat())
         try:
             reply = await run_claude(chat_id, prompt, on_progress=on_progress, touched_files=touched)
+            # 답이 비어 끊긴 경우(큰 작업 중 출력이 잘림) 자동으로 이어서 계속 — 최대 2회
+            auto = 0
+            while not reply.strip() and auto < 2:
+                auto += 1
+                await on_progress(f"↩︎ 답이 끊겨 이어서 계속하는 중 ({auto}/2)")
+                reply = await run_claude(
+                    chat_id, "직전 답변이 중간에 끊겼어. 이어서 계속해줘.",
+                    on_progress=on_progress, touched_files=touched,
+                )
         finally:
             hb.cancel()
+        if not reply.strip():
+            reply = "답을 만들다 계속 끊겼어요. 작업을 조금 더 작게 나눠 다시 보내주세요. (이어가려면 '계속')"
 
         # 진행 메시지 지우고 최종 답변 전송
         try:
