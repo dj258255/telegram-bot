@@ -556,6 +556,7 @@ MODEL_CHOICES = {
 
 # 버전 고정용 별칭 → 실제 모델 ID. (opus/sonnet 같은 alias는 '그 계열 최신'으로 구독이 해석)
 MODEL_ALIASES = {
+    "opus5": "claude-opus-5", "opus-5": "claude-opus-5",
     "opus4.8": "claude-opus-4-8", "opus-4.8": "claude-opus-4-8",
     "opus4.7": "claude-opus-4-7", "opus-4.7": "claude-opus-4-7",
     "sonnet5": "claude-sonnet-5", "sonnet-5": "claude-sonnet-5",
@@ -576,7 +577,7 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"현재 모델: {current}\n\n"
             f"고를 수 있는 모델:\n{menu}\n\n"
             "바꾸기: /model opus  ·  /model sonnet  ·  /model haiku  ·  /model fable\n"
-            "버전 고정: /model opus-4.8 · /model opus-4.7 · /model sonnet-5 (또는 정확한 ID)\n"
+            "버전 고정: /model opus-5 · /model opus-4.8 · /model sonnet-5 (또는 정확한 ID)\n"
             "기본값으로: /model default"
         )
         return
