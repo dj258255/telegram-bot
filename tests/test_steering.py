@@ -176,5 +176,53 @@ class EnsureHooksTest(unittest.TestCase):
         self.assertEqual(self.settings.read_text(), "{broken json")  # 원본 안 건드림
 
 
+
+class ThreadScopedQueueTest(unittest.TestCase):
+    """스레드마다 큐가 분리되는지. 이게 깨지면 동시에 도는 두 스레드가 서로의
+    메시지를 가져가 엉뚱한 대화에 끼워 넣는다."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.workdir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_different_threads_get_different_files(self):
+        a = steering.steer_file(self.workdir, 123, "기본")
+        b = steering.steer_file(self.workdir, 123, "incident-lab")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, steering.steer_file(self.workdir, 123, "기본"))  # 같은 스레드면 같은 경로
+
+    def test_same_slug_different_names_do_not_collide(self):
+        # 특수문자가 전부 -로 바뀌어도 해시가 붙어 충돌하지 않는다
+        a = steering.steer_file(self.workdir, 1, "a/b")
+        b = steering.steer_file(self.workdir, 1, "a:b")
+        self.assertNotEqual(a, b)
+
+    def test_queues_are_independent(self):
+        steering.enqueue(steering.steer_file(self.workdir, 7, "A"), 1, "A쪽 메시지")
+        steering.enqueue(steering.steer_file(self.workdir, 7, "B"), 2, "B쪽 메시지")
+        self.assertEqual(steering.take_pending(steering.steer_file(self.workdir, 7, "A")), ["A쪽 메시지"])
+        self.assertEqual(steering.take_pending(steering.steer_file(self.workdir, 7, "B")), ["B쪽 메시지"])
+
+    def test_drain_leftovers_parses_chat_id_from_thread_scoped_name(self):
+        steering.enqueue(steering.steer_file(self.workdir, 123, "기본"), 1, "하나")
+        steering.enqueue(steering.steer_file(self.workdir, 123, "다른스레드"), 2, "둘")
+        steering.enqueue(steering.steer_file(self.workdir, -456, "그룹"), 3, "셋")
+        left = steering.drain_leftovers(self.workdir)
+        by_chat = {}
+        for cid, texts in left:
+            by_chat.setdefault(cid, []).extend(texts)
+        self.assertEqual(sorted(by_chat[123]), ["둘", "하나"])
+        self.assertEqual(by_chat[-456], ["셋"])
+
+    def test_drain_leftovers_still_reads_legacy_filename(self):
+        # 구버전 파일명(<chat_id>.json)도 남아 있으면 회수한다
+        d = self.workdir / steering.STEER_DIRNAME
+        d.mkdir(parents=True)
+        steering.enqueue(d / "999.json", 1, "구버전에 남아 있던 것")
+        self.assertEqual(steering.drain_leftovers(self.workdir), [(999, ["구버전에 남아 있던 것"])])
+
 if __name__ == "__main__":
     unittest.main()

@@ -291,5 +291,55 @@ class ResolveDisplayModelTest(unittest.TestCase):
         self.assertEqual(bot.resolve_display_model(1), "sonnet")
 
 
+class ThreadSessionTest(unittest.TestCase):
+    """스레드별 세션 해석. 한 채팅에서 스레드 여러 개가 동시에 돌 때
+    각 턴이 자기 스레드의 대화를 이어가는지가 여기 달려 있다."""
+
+    def setUp(self):
+        self._sessions = dict(bot.sessions)
+        self._threads = dict(bot.chat_threads)
+        bot.sessions.clear()
+        bot.chat_threads.clear()
+        # 디스크 쓰기는 막는다 (테스트가 실제 상태 파일을 건드리지 않게)
+        self._save_s, self._save_t = bot.save_sessions, bot.save_threads
+        bot.save_sessions = lambda *a, **k: None
+        bot.save_threads = lambda *a, **k: None
+
+    def tearDown(self):
+        bot.save_sessions, bot.save_threads = self._save_s, self._save_t
+        bot.sessions.clear(); bot.sessions.update(self._sessions)
+        bot.chat_threads.clear(); bot.chat_threads.update(self._threads)
+
+    def test_active_thread_defaults(self):
+        self.assertEqual(bot.active_thread(1), bot.DEFAULT_THREAD)
+
+    def test_initial_state_inherits_legacy_session(self):
+        # 스레드 기록이 없던 시절의 sessions.json 값을 활성 스레드가 물려받는다
+        bot.sessions["1"] = "old-session"
+        self.assertEqual(bot.thread_session_id(1, bot.DEFAULT_THREAD), "old-session")
+
+    def test_unknown_thread_has_no_session(self):
+        bot.sessions["1"] = "old-session"
+        self.assertIsNone(bot.thread_session_id(1, "다른스레드"))
+
+    def test_set_and_read_back_per_thread(self):
+        bot.chat_threads["1"] = {"active": "A", "names": {}}
+        bot.set_thread_session(1, "A", "sid-a")
+        bot.set_thread_session(1, "B", "sid-b")
+        self.assertEqual(bot.thread_session_id(1, "A"), "sid-a")
+        self.assertEqual(bot.thread_session_id(1, "B"), "sid-b")
+        # 활성 스레드(A)만 sessions.json에 반영된다 (구버전·롤백 호환)
+        self.assertEqual(bot.sessions["1"], "sid-a")
+
+    def test_clearing_one_thread_keeps_others(self):
+        bot.chat_threads["1"] = {"active": "A", "names": {}}
+        bot.set_thread_session(1, "A", "sid-a")
+        bot.set_thread_session(1, "B", "sid-b")
+        bot.set_thread_session(1, "A", None)          # /new 가 하는 일
+        self.assertIsNone(bot.thread_session_id(1, "A"))
+        self.assertEqual(bot.thread_session_id(1, "B"), "sid-b")
+        self.assertNotIn("1", bot.sessions)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

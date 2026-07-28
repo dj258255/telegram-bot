@@ -20,8 +20,10 @@ inode에 쓴 항목이 유실되는 경쟁을 피하기 위함이다.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -30,8 +32,18 @@ STEER_DIRNAME = ".steer"
 STEER_HOOK_MARK = "steer_hook.py"
 
 
-def steer_file(workdir: Path, chat_id: int) -> Path:
-    return workdir / STEER_DIRNAME / f"{chat_id}.json"
+def _thread_token(thread: str) -> str:
+    """스레드 이름을 파일명에 쓸 토큰으로. 사람이 알아볼 슬러그 + 충돌 방지 해시.
+    스레드 이름은 한글·공백·기호가 자유로우므로 슬러그만으로는 충돌할 수 있다."""
+    name = thread or ""
+    slug = re.sub(r"[^0-9A-Za-z가-힣_-]", "-", name).strip("-")[:24]
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{slug}-{digest}" if slug else digest
+
+
+def steer_file(workdir: Path, chat_id: int, thread: str = "") -> Path:
+    """채팅×스레드 하나의 큐 파일. 스레드가 다르면 큐도 따로라 서로 간섭하지 않는다."""
+    return workdir / STEER_DIRNAME / f"{chat_id}__{_thread_token(thread)}.json"
 
 
 def _locked_mutate(path: Path, mutate):
@@ -113,11 +125,13 @@ def drain_leftovers(workdir: Path) -> list:
         return [], [e.get("text", "") for e in entries]
 
     for p in sorted(d.glob("*.json")):
-        if not p.stem.lstrip("-").isdigit():  # 그룹 채팅 id는 음수
+        # 파일명은 <chat_id>__<스레드토큰>. 구버전(<chat_id>.json)도 함께 읽는다.
+        head = p.stem.split("__", 1)[0]
+        if not head.lstrip("-").isdigit():  # 그룹 채팅 id는 음수
             continue
         texts = [t for t in _locked_mutate(p, _mut) if t]
         if texts:
-            out.append((int(p.stem), texts))
+            out.append((int(head), texts))
     return out
 
 

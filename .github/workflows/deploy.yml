@@ -42,10 +42,13 @@ jobs:
             .venv/bin/python -m py_compile bot.py || { echo '❌ bot.py 문법 오류 — 이전 커밋 유지, 배포 중단'; git reset --hard \$PREV; exit 1; }
             # 유닛테스트 — 로직 회귀가 있으면 이전 커밋으로 되돌리고 중단
             .venv/bin/python -m unittest discover -s tests -t . || { echo '❌ 테스트 실패 — 이전 커밋 유지, 배포 중단'; git reset --hard \$PREV; exit 1; }
-            # 작업 중이면(.busy 존재) 끝날 때까지 최대 5분 기다렸다가 재시작 (진행 중 작업이 끊기지 않게)
-            for i in \$(seq 1 60); do
+            # 작업 중이면(.busy 존재) 끝날 때까지 기다렸다가 재시작 (진행 중 작업이 끊기지 않게).
+            # 한 턴이 CLAUDE_TIMEOUT(기본 3시간)까지 갈 수 있어 대기 상한도 그에 맞춘다.
+            # 상한을 넘기면 그냥 재시작한다 — 배포가 영원히 막히는 쪽이 더 나쁘다.
+            for i in \$(seq 1 2160); do
               [ -f workspace/.busy ] || break
-              echo \"작업 중… 재시작 대기 (\$i/60)\"; sleep 5
+              [ \$((i % 12)) -eq 1 ] && echo \"작업 중… 재시작 대기 (\$((i * 5 / 60))분째)\"
+              sleep 5
             done
             sudo systemctl restart claude-bot
             sleep 6

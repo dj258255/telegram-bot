@@ -45,7 +45,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # 응답 대기 한도. fable+xhigh 같은 무거운 설정은 한 작업이 오래 걸리므로 넉넉히 둔다.
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "3600"))  # 초 (기본 1시간)
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "10800"))  # 초 (기본 3시간)
 
 # 기본 모델·강도는 코드에 박아둔다 (git으로 배포되므로 env 파일과 무관하게 따라감).
 # 환경변수로 덮어쓸 수 있고, 채팅 중 /model·/effort 로도 바꾼다.
@@ -164,9 +164,12 @@ TELEGRAM_MSG_LIMIT = 4000  # 실제 한도는 4096, 여유를 둠
 CANCEL_DELAY = int(os.environ.get("CANCEL_DELAY", "4"))
 
 # 실행 중인 claude 프로세스 (중단 버튼이 죽일 수 있게 보관)
-running_procs: dict[int, asyncio.subprocess.Process] = {}
+running_procs: dict[tuple, asyncio.subprocess.Process] = {}
 # 시작 전 대기 중 취소 신호
-pending_cancel: dict[int, asyncio.Event] = {}
+pending_cancel: dict[tuple, asyncio.Event] = {}
+# 취소·중단 버튼이 어느 턴을 가리키는지. 진행 메시지 id → 턴 키.
+# (한 채팅에서 스레드 여러 개가 동시에 돌 수 있으므로 버튼에 대상을 실어야 한다)
+btn_targets: dict[int, tuple] = {}
 # 채팅방별 누적 토큰·비용 (claude 응답이 보고한 값). 인메모리 — 봇 재시작 시 초기화. /usage 로 확인
 usage_totals: dict[int, dict] = {}
 
@@ -323,6 +326,41 @@ def schedule_reminder(app, item: dict) -> None:
 DEFAULT_THREAD = "기본"
 
 
+def active_thread(chat_id: int) -> str:
+    """이 채팅의 현재 활성 스레드 이름. 메시지를 받은 시점에 한 번 확정해 턴 내내 쓴다.
+    (턴이 도는 중에 /session switch 로 활성 스레드가 바뀌어도 그 턴은 원래 스레드로 끝난다)"""
+    entry = chat_threads.get(str(chat_id)) or {}
+    return entry.get("active") or DEFAULT_THREAD
+
+
+def thread_session_id(chat_id: int, thread: str) -> str | None:
+    """스레드에 붙은 claude 세션 id. 없으면 None(= 새 대화로 시작)."""
+    key = str(chat_id)
+    entry = chat_threads.get(key) or {}
+    names = entry.get("names") or {}
+    if thread in names:
+        return names[thread]
+    # 스레드 기록이 아직 없는 초기 상태: 활성 스레드는 구버전 sessions.json 값을 물려받는다
+    if thread == active_thread(chat_id):
+        return sessions.get(key)
+    return None
+
+
+def set_thread_session(chat_id: int, thread: str, session_id: str | None) -> None:
+    """스레드에 세션 id를 붙이거나(None이면 떼고) 디스크에 저장한다.
+    활성 스레드면 sessions.json 도 함께 갱신해 구버전·롤백과 호환을 유지한다."""
+    key = str(chat_id)
+    entry = chat_threads.setdefault(key, {"active": DEFAULT_THREAD, "names": {}})
+    entry["names"][thread] = session_id
+    save_threads(chat_threads)
+    if thread == (entry.get("active") or DEFAULT_THREAD):
+        if session_id:
+            sessions[key] = session_id
+        else:
+            sessions.pop(key, None)
+        save_sessions(sessions)
+
+
 def format_session_lines(entry: dict) -> str:
     """스레드 목록을 사람이 볼 문자열로. 활성엔 ▶, 아직 대화 없는 스레드엔 (새 대화). (테스트용 순수 함수)"""
     active = entry.get("active") or DEFAULT_THREAD
@@ -339,7 +377,9 @@ def format_session_lines(entry: dict) -> str:
 sessions = load_sessions()
 chat_threads = load_threads()
 reminders = load_reminders()
-chat_locks: dict[int, asyncio.Lock] = {}
+# 턴 잠금은 채팅이 아니라 **채팅×스레드** 단위다. /session 으로 스레드를 나누면
+# 서로 기다리지 않고 동시에 돈다 (한 스레드 안에서는 여전히 순서대로 하나씩).
+chat_locks: dict[tuple, asyncio.Lock] = {}
 START_TIME = time.time()
 # 채팅방별 작업 디렉터리 오버라이드 (/cd 명령). 기본은 WORKDIR.
 chat_workdirs: dict[int, Path] = {}
@@ -380,11 +420,12 @@ chat_efforts: dict[int, str] = {}
 load_prefs()  # 저장된 설정 복원 — 재시작·재배포에도 모델·강도·최근 버전 유지
 
 
-async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files: set | None = None) -> str:
-    """chat_id의 세션으로 claude를 스트리밍 실행한다.
+async def run_claude(chat_id: int, thread: str, prompt: str, on_progress=None,
+                     touched_files: set | None = None) -> str:
+    """(chat_id, thread) 스레드의 세션으로 claude를 스트리밍 실행한다.
     tool_use가 나올 때마다 on_progress(설명) 콜백을 호출하고, 최종 답변 텍스트를 반환한다.
     """
-    key = str(chat_id)
+    tkey = (chat_id, thread)
     cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose"]
     if CLAUDE_PERMISSION_MODE:
         cmd += ["--permission-mode", CLAUDE_PERMISSION_MODE]
@@ -396,16 +437,12 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         cmd += ["--effort", effort]
     # MCP 서버(context7 등)는 cwd(workspace)의 .mcp.json 에서 자동 로드된다.
 
-    if key in sessions:
-        cmd += ["--resume", sessions[key]]
+    sid = thread_session_id(chat_id, thread)
+    if sid:
+        cmd += ["--resume", sid]
     else:
         session_id = str(uuid.uuid4())
-        sessions[key] = session_id
-        save_sessions(sessions)
-        # 다중세션: 새로 만든 세션 id를 현재 활성 스레드에 기록
-        entry = chat_threads.setdefault(key, {"active": DEFAULT_THREAD, "names": {}})
-        entry["names"][entry.get("active") or DEFAULT_THREAD] = session_id
-        save_threads(chat_threads)
+        set_thread_session(chat_id, thread, session_id)
         cmd += ["--session-id", session_id, "--system-prompt", SYSTEM_PROMPT]
 
     cmd.append(prompt)
@@ -414,7 +451,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
     # 훅(steer_hook.py)이 이 채팅의 스티어링 큐를 찾을 수 있게 경로를 넘긴다.
     # (/cd로 작업 폴더를 바꾼 채팅은 workspace 훅 설정이 안 실리므로 주입 없이 예약 폴백만 동작)
     env = dict(os.environ)
-    env["TG_STEER_FILE"] = str(steering.steer_file(WORKDIR, chat_id))
+    env["TG_STEER_FILE"] = str(steering.steer_file(WORKDIR, chat_id, thread))
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -427,7 +464,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         cwd=str(workdir),
         start_new_session=True,  # 별도 프로세스 그룹 → 중단 시 자식까지 한 번에 정리
     )
-    running_procs[chat_id] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
+    running_procs[tkey] = proc  # 중단 버튼이 이 프로세스를 죽일 수 있게 등록
     _sync_busy_marker()  # 작업 중 표시 → 배포가 이걸 보고 재시작을 미룬다
 
     final_text = ""
@@ -492,7 +529,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         kill_process_group(proc)
         return "⏰ 응답 시간이 너무 오래 걸려 중단했어요. 다시 시도해 주세요."
     finally:
-        running_procs.pop(chat_id, None)
+        running_procs.pop(tkey, None)
         _sync_busy_marker()  # 남은 작업이 없으면 표시 제거
 
     # 중단 버튼으로 죽인 경우 (kill → 음수 리턴코드)
@@ -501,13 +538,8 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
 
     if proc.returncode != 0:
         stderr = (await proc.stderr.read()).decode(errors="replace").strip() if proc.stderr else ""
-        log.error("claude 실행 실패 (chat=%s): %s", chat_id, stderr)
-        sessions.pop(key, None)
-        save_sessions(sessions)
-        entry = chat_threads.get(key)
-        if entry and entry.get("names"):
-            entry["names"][entry.get("active") or DEFAULT_THREAD] = None
-            save_threads(chat_threads)
+        log.error("claude 실행 실패 (chat=%s, 스레드=%s): %s", chat_id, thread, stderr)
+        set_thread_session(chat_id, thread, None)  # 이 스레드만 초기화 (다른 스레드는 그대로)
         return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({stderr[:200]})"
 
     if chat_last_model.get(chat_id) != _prev_model:
@@ -598,15 +630,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
-    key = str(update.effective_chat.id)
-    sessions.pop(key, None)
-    save_sessions(sessions)
-    # 현재 활성 스레드의 대화만 초기화 (다른 스레드는 유지)
-    entry = chat_threads.get(key)
-    if entry and entry.get("names"):
-        entry["names"][entry.get("active") or DEFAULT_THREAD] = None
-        save_threads(chat_threads)
-    await update.message.reply_text("🆕 새 대화를 시작합니다.")
+    chat_id = update.effective_chat.id
+    thread = active_thread(chat_id)
+    set_thread_session(chat_id, thread, None)  # 활성 스레드만 초기화 (다른 스레드는 유지)
+    await update.message.reply_text(f"🆕 '{thread}' 스레드에서 새 대화를 시작합니다.")
 
 
 # 고를 수 있는 모델 별칭과 설명
@@ -1082,7 +1109,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "기본(high)"
     workdir = chat_workdirs.get(chat_id, WORKDIR)
     mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
-    busy = "작업 중" if chat_id in running_procs else "대기 중"
+    running = [th for (cid, th) in running_procs if cid == chat_id]
+    busy = ("작업 중: " + ", ".join(running)) if running else "대기 중"
     # 절대경로(서버 내부 구조)를 그대로 노출하지 않고 홈 기준 상대경로로 표시
     try:
         shown_dir = "~/" + str(workdir.relative_to(Path.home()))
@@ -1201,7 +1229,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     chat_id = update.effective_chat.id
-    lock = chat_locks.setdefault(chat_id, asyncio.Lock())
+    # 이 턴이 속할 스레드를 메시지 받은 시점에 확정한다. 잠금·큐·프로세스가 전부
+    # 이 키를 쓰므로, 다른 스레드에서 온 메시지는 서로 기다리지 않고 동시에 돈다.
+    thread = active_thread(chat_id)
+    tkey = (chat_id, thread)
+    steer_path = steering.steer_file(WORKDIR, chat_id, thread)
+    lock = chat_locks.setdefault(tkey, asyncio.Lock())
 
     # 작업 중 도착한 메시지 → 스티어링 큐에 기록. 훅이 진행 중 턴의 도구 호출
     # 사이(PostToolUse)나 종료 직전(Stop)에 끼워 넣고, 못 끼워 넣으면 아래
@@ -1214,9 +1247,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if prompt is None:
             return
         steer_id = update.message.message_id
-        steering.enqueue(steering.steer_file(WORKDIR, chat_id), steer_id, prompt)
+        steering.enqueue(steer_path, steer_id, prompt)
         steer_note = await update.message.reply_text(
-            "📌 작업 중이네요 — 지금 하는 작업에 실시간으로 끼워 넣을게요. (안 되면 끝나는 대로 이어서 처리)"
+            f"📌 '{thread}' 스레드가 작업 중이네요. 지금 하는 작업에 실시간으로 끼워 넣을게요.\n"
+            "(다른 일을 동시에 시키려면 /session new 로 스레드를 나누세요)"
         )
 
     async def edit_steer_note(text: str) -> None:
@@ -1229,7 +1263,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     async with lock:
         if steer_id is not None:
-            status, merged = steering.claim(steering.steer_file(WORKDIR, chat_id), steer_id)
+            status, merged = steering.claim(steer_path, steer_id)
             if status == "injected":
                 await edit_steer_note("✅ 진행 중이던 작업에 실시간으로 반영했어요. 답변은 위 작업 결과에 포함돼요.")
                 return
@@ -1247,8 +1281,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         status_msg = await update.message.reply_text("🤔 생각 중…")
         if CLAUDE_PERMISSION_MODE and CANCEL_DELAY > 0:
             cancel_ev = asyncio.Event()
-            pending_cancel[chat_id] = cancel_ev
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🚫 취소", callback_data="cancel")]])
+            pending_cancel[tkey] = cancel_ev
+            btn_targets[status_msg.message_id] = tkey
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🚫 취소", callback_data=f"cancel:{status_msg.message_id}")]])
             await context.bot.edit_message_text(
                 f"⏳ {CANCEL_DELAY}초 뒤 시작해요. 잘못 보냈다면 취소를 누르세요.",
                 chat_id=chat_id, message_id=status_msg.message_id, reply_markup=kb,
@@ -1262,17 +1298,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             except asyncio.TimeoutError:
                 pass  # 시간 지나면 그대로 진행
             finally:
-                pending_cancel.pop(chat_id, None)
+                pending_cancel.pop(tkey, None)
 
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
         # 진행 상황 표시 + 중단 버튼
         actions: list[str] = []
         last_edit = 0.0
-        stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 중단", callback_data="stop")]])
-        # 진행 메시지 최상단에 현재 모델(버전까지)·강도를 표시
+        btn_targets[status_msg.message_id] = tkey
+        stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🛑 중단", callback_data=f"stop:{status_msg.message_id}")]])
+        # 진행 메시지 최상단에 스레드·모델(버전까지)·강도를 표시.
+        # 스레드가 여럿 동시에 돌 수 있으므로 어느 스레드의 진행인지 먼저 밝힌다.
         cur_effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "high"
-        header = f"현재 모델: {resolve_display_model(chat_id)} · 강도 {cur_effort}\n\n"
+        header = f"🧵 {thread} · {resolve_display_model(chat_id)} · 강도 {cur_effort}\n\n"
 
         async def refresh(text: str) -> None:
             try:
@@ -1316,14 +1355,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         touched: set[str] = set()
         hb = asyncio.create_task(heartbeat())
         try:
-            reply = await run_claude(chat_id, prompt, on_progress=on_progress, touched_files=touched)
+            reply = await run_claude(chat_id, thread, prompt, on_progress=on_progress, touched_files=touched)
             # 답이 비어 끊긴 경우(큰 작업 중 출력이 잘림) 자동으로 이어서 계속 — 최대 2회
             auto = 0
             while not reply.strip() and auto < 2:
                 auto += 1
                 await on_progress(f"↩︎ 답이 끊겨 이어서 계속하는 중 ({auto}/2)")
                 reply = await run_claude(
-                    chat_id, "직전 답변이 중간에 끊겼어. 이어서 계속해줘.",
+                    chat_id, thread, "직전 답변이 중간에 끊겼어. 이어서 계속해줘.",
                     on_progress=on_progress, touched_files=touched,
                 )
         finally:
@@ -1332,6 +1371,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             reply = "답을 만들다 계속 끊겼어요. 작업을 조금 더 작게 나눠 다시 보내주세요. (이어가려면 '계속')"
 
         # 진행 메시지 지우고 최종 답변 전송
+        btn_targets.pop(status_msg.message_id, None)  # 이 턴을 가리키던 버튼 대상 정리
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
         except Exception:
@@ -1404,18 +1444,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("권한이 없어요.")
         return
     chat_id = query.message.chat_id
-    if query.data == "cancel":
-        ev = pending_cancel.get(chat_id)
+    # callback_data는 "<동작>:<진행 메시지 id>" 형태다. 한 채팅에서 스레드 여러 개가
+    # 동시에 돌 수 있으므로, 누른 버튼이 어느 턴의 것인지 메시지 id로 되짚는다.
+    action, _, token = (query.data or "").partition(":")
+    tkey = btn_targets.get(int(token)) if token.isdigit() else None
+    if tkey is None:  # 구버전 버튼이거나 이미 끝난 턴
+        tkey = (chat_id, active_thread(chat_id))
+
+    if action == "cancel":
+        ev = pending_cancel.get(tkey)
         if ev:
             ev.set()
             await query.answer("취소했어요.")
         else:
             await query.answer("이미 시작됐어요. 중단 버튼을 쓰세요.")
-    elif query.data == "stop":
-        proc = running_procs.get(chat_id)
+    elif action == "stop":
+        proc = running_procs.get(tkey)
         if proc:
             kill_process_group(proc)  # 자식·손자까지 그룹째 죽여 즉시 멈춘다
-            await query.answer("중단했어요.")
+            await query.answer(f"'{tkey[1]}' 스레드 작업을 중단했어요.")
         else:
             await query.answer("실행 중인 작업이 없어요.")
 
