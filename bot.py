@@ -139,6 +139,8 @@ SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 THREADS_FILE = Path(__file__).parent / "threads.json"
 # 리마인더(/remind): 배포로 재시작돼도 안 날아가게 파일에 저장하고 시작 시 복원한다.
 REMINDERS_FILE = Path(__file__).parent / "reminders.json"
+# 채팅방별 설정(모델·강도)과 최근 실제 모델 버전. 봇 재시작에도 유지된다.
+PREFS_FILE = Path(__file__).parent / "prefs.json"
 # 실행 중인 리마인더 태스크 참조 — asyncio가 태스크를 약한참조만 들어 GC하는 걸 막는다.
 _reminder_tasks: set = set()
 
@@ -253,6 +255,33 @@ def save_reminders() -> None:
     _atomic_write(REMINDERS_FILE, json.dumps(reminders, ensure_ascii=False, indent=2))
 
 
+def load_prefs() -> None:
+    """prefs.json에서 채팅방별 모델·강도·최근 버전을 복원한다. 실패해도 봇은 계속 뜬다."""
+    if not PREFS_FILE.exists():
+        return
+    try:
+        data = json.loads(PREFS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        log.warning("prefs.json 파싱 실패 — 무시하고 시작")
+        return
+    for cid, m in (data.get("models") or {}).items():
+        chat_models[int(cid)] = m
+    for cid, e in (data.get("efforts") or {}).items():
+        chat_efforts[int(cid)] = e
+    for cid, m in (data.get("last_model") or {}).items():
+        chat_last_model[int(cid)] = m
+
+
+def save_prefs() -> None:
+    """현재 채팅방별 설정과 최근 모델 버전을 디스크에 저장한다."""
+    data = {
+        "models": {str(k): v for k, v in chat_models.items()},
+        "efforts": {str(k): v for k, v in chat_efforts.items()},
+        "last_model": {str(k): v for k, v in chat_last_model.items()},
+    }
+    _atomic_write(PREFS_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+
+
 def parse_duration_seconds(s: str) -> int | None:
     """'30s'·'10m'·'2h'·'1d'·'45'(단위 없으면 분) → 초. 잘못되면 None. (테스트용 순수 함수)"""
     s = (s or "").strip().lower()
@@ -341,6 +370,8 @@ chat_last_model: dict[int, str] = {}
 # 채팅방별 사고 강도 오버라이드 (/effort 명령으로 설정)
 chat_efforts: dict[int, str] = {}
 
+load_prefs()  # 저장된 설정 복원 — 재시작·재배포에도 모델·강도·최근 버전 유지
+
 
 async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files: set | None = None) -> str:
     """chat_id의 세션으로 claude를 스트리밍 실행한다.
@@ -389,6 +420,7 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
 
     final_text = ""
     agents: dict[str, int] = {}  # Task 도구 tool_use_id → 하위 에이전트 번호
+    _prev_model = chat_last_model.get(chat_id)  # 이번 턴에서 실제 버전이 바뀌면 저장하려고 기억
 
     async def read_stream() -> None:
         nonlocal final_text
@@ -466,6 +498,8 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
             save_threads(chat_threads)
         return f"⚠️ Claude 실행에 실패했어요. 세션을 초기화했으니 다시 보내주세요.\n({stderr[:200]})"
 
+    if chat_last_model.get(chat_id) != _prev_model:
+        save_prefs()  # 이번 턴에서 실제 모델 버전이 새로 잡혔으면 디스크에 반영
     return final_text.strip()  # 빈 응답이면 "" → 호출부가 자동 이어가기로 처리
 
 
@@ -582,6 +616,33 @@ MODEL_ALIASES = {
 }
 
 
+def pretty_model(model: str) -> str:
+    """모델 ID를 사람이 읽기 좋은 라벨로. 'claude-opus-4-8' → 'opus 4.8'. 별칭·미지 값은 그대로."""
+    if not model:
+        return "기본(구독)"
+    parts = model.lower().split("-")
+    # claude-<계열>-<major>[-<minor>][-<날짜>]
+    if len(parts) >= 3 and parts[0] == "claude" and parts[1] in ("opus", "sonnet", "haiku", "fable") and parts[2].isdigit():
+        fam, major = parts[1], parts[2]
+        minor = parts[3] if len(parts) >= 4 and parts[3].isdigit() else None
+        return f"{fam} {major}.{minor}" if minor else f"{fam} {major}"
+    return model
+
+
+def resolve_display_model(chat_id: int) -> str:
+    """이번 턴이 쓸 모델을 버전까지 붙여 보기 좋게. 버전 고정이면 정확히,
+    별칭이면 같은 계열의 최근 실제 버전을 힌트로 쓴다(예: 설정 'opus' + 최근 'claude-opus-4-8' → 'opus 4.8')."""
+    setting = chat_models.get(chat_id, DEFAULT_MODEL)
+    if setting and setting.startswith("claude-"):
+        return pretty_model(setting)  # 버전 고정 → 그대로 정확
+    last = chat_last_model.get(chat_id)
+    if setting:  # 별칭(opus/sonnet 등)
+        if last and last.lower().startswith(f"claude-{setting.lower()}-"):
+            return pretty_model(last)
+        return setting
+    return pretty_model(last) if last else "기본(구독)"  # 설정 비움(구독 기본값)
+
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -589,9 +650,10 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     arg = " ".join(context.args).strip() if context.args else ""
     if not arg:
         setting = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독)"
-        actual = chat_last_model.get(chat_id)
-        # 설정은 alias('opus')여도 실제로 쓰인 버전(claude-opus-4-8)을 함께 보여준다
-        current = f"{setting} (실제: {actual})" if actual and actual != setting else setting
+        # 설정은 alias('opus')여도 실제로 쓰인 버전(opus 4.8)을 함께 보여준다
+        current = resolve_display_model(chat_id)
+        if current != setting and not str(setting).startswith("claude-"):
+            current = f"{current} (설정: {setting})"
         menu = "\n".join(f"• {name} — {desc}" for name, desc in MODEL_CHOICES.items())
         await update.message.reply_text(
             f"현재 모델: {current}\n\n"
@@ -603,10 +665,12 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if arg.lower() in ("default", "기본", "reset"):
         chat_models.pop(chat_id, None)
+        save_prefs()
         await update.message.reply_text("모델을 기본값으로 되돌렸어요.")
     else:
         model = MODEL_ALIASES.get(arg.lower(), arg)  # opus-4.8 같은 단축은 실제 ID로
         chat_models[chat_id] = model
+        save_prefs()
         note = f" — {MODEL_CHOICES[arg.lower()]}" if arg.lower() in MODEL_CHOICES else ""
         shown = model if model == arg else f"{arg} → {model}"
         await update.message.reply_text(f"모델을 '{shown}'(으)로 설정했어요{note}. (다음 메시지부터 적용)")
@@ -639,9 +703,11 @@ async def cmd_effort(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if arg in ("default", "기본", "reset"):
         chat_efforts.pop(chat_id, None)
+        save_prefs()
         await update.message.reply_text("사고 강도를 기본값으로 되돌렸어요.")
     elif arg in EFFORT_CHOICES:
         chat_efforts[chat_id] = arg
+        save_prefs()
         await update.message.reply_text(
             f"사고 강도를 '{arg}'(으)로 설정했어요 — {EFFORT_CHOICES[arg]}. (다음 메시지부터 적용)"
         )
@@ -997,8 +1063,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     chat_id = update.effective_chat.id
     _set = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
-    _act = chat_last_model.get(chat_id)
-    model = f"{_set} (실제: {_act})" if _act and _act != _set else _set
+    model = resolve_display_model(chat_id)
+    # 설정이 별칭(opus 등)이라 실제 버전과 다르면 설정도 함께 보여준다
+    if model != _set and not str(_set).startswith("claude-"):
+        model = f"{model} (설정: {_set})"
     effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "기본(high)"
     workdir = chat_workdirs.get(chat_id, WORKDIR)
     mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
@@ -1147,10 +1215,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         actions: list[str] = []
         last_edit = 0.0
         stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 중단", callback_data="stop")]])
-        # 진행 메시지 최상단에 현재 모델·강도를 표시
-        cur_model = chat_last_model.get(chat_id) or chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+        # 진행 메시지 최상단에 현재 모델(버전까지)·강도를 표시
         cur_effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "high"
-        header = f"현재 모델: {cur_model} · 강도 {cur_effort}\n\n"
+        header = f"현재 모델: {resolve_display_model(chat_id)} · 강도 {cur_effort}\n\n"
 
         async def refresh(text: str) -> None:
             try:

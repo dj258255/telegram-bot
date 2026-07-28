@@ -246,5 +246,50 @@ class AtomicWriteTest(unittest.TestCase):
         self.assertEqual(p.read_text(), '{"a": 2}')
 
 
+class PrettyModelTest(unittest.TestCase):
+    def test_pinned_ids_get_version_label(self):
+        self.assertEqual(bot.pretty_model("claude-opus-4-8"), "opus 4.8")
+        self.assertEqual(bot.pretty_model("claude-opus-5"), "opus 5")
+        self.assertEqual(bot.pretty_model("claude-sonnet-5"), "sonnet 5")
+        self.assertEqual(bot.pretty_model("claude-haiku-4-5-20251001"), "haiku 4.5")
+        self.assertEqual(bot.pretty_model("claude-fable-5"), "fable 5")
+
+    def test_alias_and_empty_unchanged(self):
+        self.assertEqual(bot.pretty_model("opus"), "opus")
+        self.assertEqual(bot.pretty_model("sonnet"), "sonnet")
+        self.assertEqual(bot.pretty_model(""), "기본(구독)")
+
+
+class ResolveDisplayModelTest(unittest.TestCase):
+    def setUp(self):
+        self._m, self._l = dict(bot.chat_models), dict(bot.chat_last_model)
+        bot.chat_models.clear()
+        bot.chat_last_model.clear()
+
+    def tearDown(self):
+        bot.chat_models.clear()
+        bot.chat_models.update(self._m)
+        bot.chat_last_model.clear()
+        bot.chat_last_model.update(self._l)
+
+    def test_pinned_setting_shows_version(self):
+        bot.chat_models[1] = "claude-opus-5"
+        self.assertEqual(bot.resolve_display_model(1), "opus 5")
+
+    def test_alias_uses_last_version_of_same_family(self):
+        bot.chat_models[1] = "opus"
+        bot.chat_last_model[1] = "claude-opus-4-8"
+        self.assertEqual(bot.resolve_display_model(1), "opus 4.8")
+
+    def test_alias_without_last_stays_alias(self):
+        bot.chat_models[1] = "opus"
+        self.assertEqual(bot.resolve_display_model(1), "opus")
+
+    def test_alias_ignores_last_of_other_family(self):
+        bot.chat_models[1] = "sonnet"
+        bot.chat_last_model[1] = "claude-opus-4-8"
+        self.assertEqual(bot.resolve_display_model(1), "sonnet")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
