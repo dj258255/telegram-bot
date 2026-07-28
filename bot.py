@@ -325,6 +325,52 @@ def schedule_reminder(app, item: dict) -> None:
 
 DEFAULT_THREAD = "기본"
 
+# 봇이 보낸 메시지 id → 그 메시지가 속한 스레드. 사용자가 답장(reply)으로 보내면
+# 이걸로 어느 스레드에 말을 거는지 알아낸다. 채팅창은 하나인데 스레드가 여럿이라
+# "이 답변에 이어서 말하기"를 메신저답게 표현할 수단이 필요하다.
+msg_thread: dict[int, str] = {}
+MSG_THREAD_MAX = 800  # 무한 증가 방지. 오래된 것부터 버린다
+
+
+def remember_thread_msg(message, thread: str) -> None:
+    """봇이 보낸 메시지를 스레드에 묶어 기억한다. 실패해도 대화에는 지장이 없다."""
+    try:
+        msg_thread[message.message_id] = thread
+    except Exception:
+        return
+    if len(msg_thread) > MSG_THREAD_MAX:
+        for mid in sorted(msg_thread)[: len(msg_thread) - MSG_THREAD_MAX]:
+            msg_thread.pop(mid, None)
+
+
+def parse_thread_prefix(text: str, known: set) -> tuple[str | None, str]:
+    """'@스레드명 내용' 접두사를 떼어낸다. 아는 스레드가 아니면 건드리지 않는다.
+    (@가 붙은 평범한 문장을 스레드 지정으로 오해하지 않게 실재하는 이름만 받는다)"""
+    s = (text or "").lstrip()
+    if not s.startswith("@"):
+        return None, text
+    head, sep, rest = s[1:].partition(" ")
+    if sep and head in known:
+        return head, rest.lstrip()
+    return None, text
+
+
+def route_thread(chat_id: int, message) -> str:
+    """이 메시지가 어느 스레드로 갈지 정한다.
+    우선순위: @접두사 > 답장한 메시지의 스레드 > 현재 활성 스레드."""
+    entry = chat_threads.get(str(chat_id)) or {}
+    known = set(entry.get("names") or {})
+    text = message.text or message.caption or ""
+    named, _ = parse_thread_prefix(text, known)
+    if named:
+        return named
+    replied = message.reply_to_message
+    if replied is not None:
+        found = msg_thread.get(replied.message_id)
+        if found and (not known or found in known):
+            return found
+    return active_thread(chat_id)
+
 
 def active_thread(chat_id: int) -> str:
     """이 채팅의 현재 활성 스레드 이름. 메시지를 받은 시점에 한 번 확정해 턴 내내 쓴다.
@@ -361,16 +407,20 @@ def set_thread_session(chat_id: int, thread: str, session_id: str | None) -> Non
         save_sessions(sessions)
 
 
-def format_session_lines(entry: dict) -> str:
-    """스레드 목록을 사람이 볼 문자열로. 활성엔 ▶, 아직 대화 없는 스레드엔 (새 대화). (테스트용 순수 함수)"""
+def format_session_lines(entry: dict, running: set | None = None) -> str:
+    """스레드 목록을 사람이 볼 문자열로. 활성엔 ▶, 대화 없는 스레드엔 (새 대화),
+    지금 도는 스레드엔 ⚙ 작업 중. (테스트용 순수 함수)"""
     active = entry.get("active") or DEFAULT_THREAD
     names = entry.get("names") or {}
+    running = running or set()
     if not names:
-        return f"▶ {active} (새 대화)"
+        tail = " ⚙ 작업 중" if active in running else " (새 대화)"
+        return f"▶ {active}{tail}"
     lines = []
     for n, sid in names.items():
         mark = "▶ " if n == active else "   "
-        lines.append(f"{mark}{n}{'' if sid else ' (새 대화)'}")
+        tail = " ⚙ 작업 중" if n in running else ("" if sid else " (새 대화)")
+        lines.append(f"{mark}{n}{tail}")
     return "\n".join(lines)
 
 
@@ -838,9 +888,12 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     name = " ".join(args[1:]).strip()
 
     if sub in ("list", "ls", "목록"):
+        running = {th for (cid, th) in running_procs if cid == update.effective_chat.id}
         await update.message.reply_text(
-            "🧵 대화 세션\n" + format_session_lines(entry) +
-            "\n\n새로: /session new 이름 · 전환: /session switch 이름 · 삭제: /session delete 이름"
+            "🧵 대화 세션\n" + format_session_lines(entry, running) +
+            "\n\n새로: /session new 이름 · 전환: /session switch 이름 · 삭제: /session delete 이름\n"
+            "스레드는 서로 기다리지 않고 동시에 돕니다. 특정 스레드에 바로 말하려면 "
+            "그 스레드의 메시지에 답장하거나 '@이름 내용' 으로 보내세요."
         )
         return
     if sub in ("new", "create", "새로"):
@@ -1197,6 +1250,9 @@ async def build_incoming_prompt(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = update.effective_chat.id
     # 사진은 caption, 일반 메시지는 text 에 내용이 담긴다
     prompt = (update.message.text or update.message.caption or "").strip()
+    # '@스레드명 내용' 으로 보냈으면 접두사는 라우팅에 이미 쓰였으니 본문에서 뗀다
+    entry = chat_threads.get(str(chat_id)) or {}
+    _, prompt = parse_thread_prefix(prompt, set(entry.get("names") or {}))
 
     # 음성 메시지면 먼저 텍스트로 변환
     if update.message.voice or update.message.audio:
@@ -1231,7 +1287,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat_id = update.effective_chat.id
     # 이 턴이 속할 스레드를 메시지 받은 시점에 확정한다. 잠금·큐·프로세스가 전부
     # 이 키를 쓰므로, 다른 스레드에서 온 메시지는 서로 기다리지 않고 동시에 돈다.
-    thread = active_thread(chat_id)
+    thread = route_thread(chat_id, update.message)
     tkey = (chat_id, thread)
     steer_path = steering.steer_file(WORKDIR, chat_id, thread)
     lock = chat_locks.setdefault(tkey, asyncio.Lock())
@@ -1252,6 +1308,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"📌 '{thread}' 스레드가 작업 중이네요. 지금 하는 작업에 실시간으로 끼워 넣을게요.\n"
             "(다른 일을 동시에 시키려면 /session new 로 스레드를 나누세요)"
         )
+        remember_thread_msg(steer_note, thread)
 
     async def edit_steer_note(text: str) -> None:
         try:
@@ -1279,6 +1336,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         # 코딩 모드면 실행 전 잠깐 취소 기회를 준다 (잘못 보낸 명령 방어)
         status_msg = await update.message.reply_text("🤔 생각 중…")
+        remember_thread_msg(status_msg, thread)
         if CLAUDE_PERMISSION_MODE and CANCEL_DELAY > 0:
             cancel_ev = asyncio.Event()
             pending_cancel[tkey] = cancel_ev
@@ -1381,9 +1439,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         elapsed = asyncio.get_event_loop().time() - work_start
         is_error = reply.startswith(("⏰", "🛑", "⚠️"))
         prefix = "✅ 완료!\n\n" if (elapsed > 30 and not is_error) else ""
+        # 채팅창은 하나인데 스레드가 여럿일 수 있다. 어느 대화의 답인지 헷갈릴
+        # 상황에서만 스레드 이름을 붙인다 (기본 스레드 하나만 돌 때는 안 붙여 깔끔하게).
+        others_running = any(cid == chat_id and th != thread for (cid, th) in running_procs)
+        if thread != DEFAULT_THREAD or others_running:
+            prefix = f"🧵 {thread}\n\n" + prefix
         chunks = split_message(prefix + reply)
         for chunk in chunks:
-            await update.message.reply_text(chunk)
+            # 원래 요청에 대한 답장으로 보낸다. 텔레그램이 인용을 띄워줘서
+            # 여러 작업이 동시에 끝나도 어느 요청의 답인지 바로 보인다.
+            sent = await update.message.reply_text(chunk, reply_to_message_id=update.message.message_id)
+            remember_thread_msg(sent, thread)  # 이 답변에 답장하면 같은 스레드로 이어진다
 
         # 긴 답변은 .md 파일로도 첨부 (저장·가독성)
         if not is_error and len(reply) > LONG_ANSWER_LIMIT:

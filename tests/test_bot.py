@@ -341,5 +341,81 @@ class ThreadSessionTest(unittest.TestCase):
         self.assertNotIn("1", bot.sessions)
 
 
+class _FakeMsg:
+    """route_thread 검증용 최소 메시지. 텔레그램 없이 라우팅 규칙만 본다."""
+
+    def __init__(self, text=None, caption=None, reply_to=None, message_id=1):
+        self.text = text
+        self.caption = caption
+        self.reply_to_message = reply_to
+        self.message_id = message_id
+
+
+class ThreadRoutingTest(unittest.TestCase):
+    """채팅창은 하나인데 스레드가 여럿일 때, 이 메시지가 어디로 갈지 정하는 규칙."""
+
+    def setUp(self):
+        self._threads = dict(bot.chat_threads)
+        self._msg = dict(bot.msg_thread)
+        bot.chat_threads.clear()
+        bot.msg_thread.clear()
+        bot.chat_threads["1"] = {"active": "기본", "names": {"기본": "s0", "검색": "s1", "봇": "s2"}}
+
+    def tearDown(self):
+        bot.chat_threads.clear(); bot.chat_threads.update(self._threads)
+        bot.msg_thread.clear(); bot.msg_thread.update(self._msg)
+
+    def test_defaults_to_active_thread(self):
+        self.assertEqual(bot.route_thread(1, _FakeMsg(text="안녕")), "기본")
+
+    def test_prefix_routes_to_named_thread(self):
+        self.assertEqual(bot.route_thread(1, _FakeMsg(text="@검색 진행 상황 알려줘")), "검색")
+
+    def test_unknown_prefix_is_left_alone(self):
+        # 실재하지 않는 이름이면 스레드 지정이 아니라 평범한 문장으로 본다
+        self.assertEqual(bot.route_thread(1, _FakeMsg(text="@없는스레드 안녕")), "기본")
+
+    def test_prefix_is_stripped_from_body(self):
+        known = {"검색", "봇"}
+        self.assertEqual(bot.parse_thread_prefix("@검색 진행 상황", known), ("검색", "진행 상황"))
+        self.assertEqual(bot.parse_thread_prefix("@없음 진행 상황", known), (None, "@없음 진행 상황"))
+        # @만 있고 내용이 없으면 스레드 지정으로 보지 않는다
+        self.assertEqual(bot.parse_thread_prefix("@검색", known), (None, "@검색"))
+
+    def test_reply_routes_to_that_threads_conversation(self):
+        bot.msg_thread[100] = "봇"
+        msg = _FakeMsg(text="이어서 해줘", reply_to=_FakeMsg(message_id=100))
+        self.assertEqual(bot.route_thread(1, msg), "봇")
+
+    def test_reply_to_unknown_message_falls_back_to_active(self):
+        msg = _FakeMsg(text="이어서", reply_to=_FakeMsg(message_id=999))
+        self.assertEqual(bot.route_thread(1, msg), "기본")
+
+    def test_prefix_beats_reply(self):
+        bot.msg_thread[100] = "봇"
+        msg = _FakeMsg(text="@검색 이건 검색 쪽", reply_to=_FakeMsg(message_id=100))
+        self.assertEqual(bot.route_thread(1, msg), "검색")
+
+    def test_remember_thread_msg_is_bounded(self):
+        for i in range(bot.MSG_THREAD_MAX + 50):
+            bot.remember_thread_msg(_FakeMsg(message_id=i), "기본")
+        self.assertLessEqual(len(bot.msg_thread), bot.MSG_THREAD_MAX)
+        # 오래된 것부터 버리므로 최신 id는 남아 있다
+        self.assertIn(bot.MSG_THREAD_MAX + 49, bot.msg_thread)
+
+
+class SessionLinesRunningTest(unittest.TestCase):
+    def test_running_thread_is_marked(self):
+        entry = {"active": "기본", "names": {"기본": "s0", "검색": "s1"}}
+        out = bot.format_session_lines(entry, running={"검색"})
+        self.assertIn("▶ 기본", out)
+        self.assertIn("검색 ⚙ 작업 중", out)
+
+    def test_no_running_keeps_previous_format(self):
+        entry = {"active": "기본", "names": {"기본": "s0", "검색": None}}
+        out = bot.format_session_lines(entry)
+        self.assertIn("검색 (새 대화)", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
