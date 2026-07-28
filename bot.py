@@ -336,6 +336,8 @@ def fmt_uptime(seconds: float) -> str:
 
 # 채팅방별 모델 오버라이드 (/model 명령으로 설정)
 chat_models: dict[int, str] = {}
+# 채팅방별 '최근 실제 사용된 모델 ID' — claude 응답 스트림에서 잡아 버전까지 표시 (alias여도 실버전 노출)
+chat_last_model: dict[int, str] = {}
 # 채팅방별 사고 강도 오버라이드 (/effort 명령으로 설정)
 chat_efforts: dict[int, str] = {}
 
@@ -399,6 +401,9 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
             # 하위 에이전트가 낸 이벤트는 parent_tool_use_id 로 어느 에이전트인지 구분된다
             parent_id = event.get("parent_tool_use_id")
             if etype == "assistant":
+                _m = event.get("message", {}).get("model")
+                if _m:
+                    chat_last_model[chat_id] = _m  # 실제 사용 모델 버전 기록
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") != "tool_use" or not on_progress:
                         continue
@@ -571,7 +576,10 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     arg = " ".join(context.args).strip() if context.args else ""
     if not arg:
-        current = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독, 보통 sonnet)"
+        setting = chat_models.get(chat_id, DEFAULT_MODEL) or "기본값(구독)"
+        actual = chat_last_model.get(chat_id)
+        # 설정은 alias('opus')여도 실제로 쓰인 버전(claude-opus-4-8)을 함께 보여준다
+        current = f"{setting} (실제: {actual})" if actual and actual != setting else setting
         menu = "\n".join(f"• {name} — {desc}" for name, desc in MODEL_CHOICES.items())
         await update.message.reply_text(
             f"현재 모델: {current}\n\n"
@@ -976,7 +984,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_allowed(update):
         return
     chat_id = update.effective_chat.id
-    model = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+    _set = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+    _act = chat_last_model.get(chat_id)
+    model = f"{_set} (실제: {_act})" if _act and _act != _set else _set
     effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "기본(high)"
     workdir = chat_workdirs.get(chat_id, WORKDIR)
     mode = "코딩 모드" if CLAUDE_PERMISSION_MODE else "대화 전용"
@@ -1126,7 +1136,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         last_edit = 0.0
         stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 중단", callback_data="stop")]])
         # 진행 메시지 최상단에 현재 모델·강도를 표시
-        cur_model = chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
+        cur_model = chat_last_model.get(chat_id) or chat_models.get(chat_id, DEFAULT_MODEL) or "기본(구독)"
         cur_effort = chat_efforts.get(chat_id, DEFAULT_EFFORT) or "high"
         header = f"현재 모델: {cur_model} · 강도 {cur_effort}\n\n"
 
