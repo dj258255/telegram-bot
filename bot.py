@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -34,6 +35,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+import steering  # 작업 중 도착한 메시지를 진행 중 턴에 끼워 넣는 큐 (훅과 공유)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("claude-bot")
@@ -131,6 +134,10 @@ UPLOADS_DIR.mkdir(exist_ok=True)
 
 # MCP 서버 설정 (context7 등). 있으면 봇 실행 시 자동 로드.
 MCP_CONFIG = WORKDIR / ".mcp.json"
+
+# 실시간 스티어링: 작업 중 온 메시지를 진행 중 claude 턴에 끼워 넣는 훅과 그 설정 위치
+STEER_HOOK_SCRIPT = Path(__file__).parent / "hooks" / "steer_hook.py"
+CLAUDE_SETTINGS_FILE = WORKDIR / ".claude" / "settings.json"
 
 # 채팅방별 세션 ID를 저장해서 봇을 재시작해도 대화가 이어지게 함
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
@@ -404,10 +411,15 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
     cmd.append(prompt)
 
     workdir = chat_workdirs.get(chat_id, WORKDIR)
+    # 훅(steer_hook.py)이 이 채팅의 스티어링 큐를 찾을 수 있게 경로를 넘긴다.
+    # (/cd로 작업 폴더를 바꾼 채팅은 workspace 훅 설정이 안 실리므로 주입 없이 예약 폴백만 동작)
+    env = dict(os.environ)
+    env["TG_STEER_FILE"] = str(steering.steer_file(WORKDIR, chat_id))
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
         # 기본 asyncio 스트림 한계는 64KB다. 이미지 Read(base64)나 큰 파일처럼
         # stream-json 이벤트 한 줄이 64KB를 넘으면 LimitOverrunError로 죽어
         # "처리 중 문제가 생겼어요"가 뜬다. 넉넉히 16MB로 올린다.
@@ -1151,42 +1163,85 @@ async def send_answer_file(update: Update, text: str) -> None:
         pass  # 첨부 실패해도 본문은 이미 전송됨
 
 
+async def build_incoming_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """메시지 하나를 claude에 넘길 프롬프트로 만든다 (음성 변환·첨부 저장·답장 맥락).
+    내용이 없거나 변환에 실패하면 None (안내는 각 단계가 이미 보냄)."""
+    chat_id = update.effective_chat.id
+    # 사진은 caption, 일반 메시지는 text 에 내용이 담긴다
+    prompt = (update.message.text or update.message.caption or "").strip()
+
+    # 음성 메시지면 먼저 텍스트로 변환
+    if update.message.voice or update.message.audio:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        transcript = await transcribe_voice(update)
+        if not transcript:
+            return None  # 변환 실패 시 안내는 transcribe_voice가 이미 보냄
+        await update.message.reply_text(f"🎤 들은 내용: {transcript}")
+        prompt = transcript
+
+    attachment = await save_attachment(update, context)
+    if attachment:
+        # Claude가 읽을 수 있도록 저장 경로를 프롬프트에 포함
+        note = f"[사용자가 파일을 첨부함: {attachment}]"
+        prompt = f"{note}\n{prompt}" if prompt else f"{note}\n이 파일을 확인하고 설명해 주세요."
+    elif not prompt:
+        return None  # 내용 없는 메시지는 무시
+
+    # 텔레그램 '답장(reply)'으로 보냈으면, 답장 대상 메시지를 맥락으로 붙인다.
+    # (봇의 이전 답변이든 내 메시지든 — 세션 히스토리 중 '어느 것에 대한 얘기인지' 짚어준다)
+    replied = update.message.reply_to_message
+    if replied:
+        prompt = build_prompt_with_reply(prompt, replied.text or replied.caption)
+    return prompt
+
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         log.info("허용되지 않은 사용자 차단: %s", update.effective_user.id if update.effective_user else "?")
         return
 
     chat_id = update.effective_chat.id
-    # 사진은 caption, 일반 메시지는 text 에 내용이 담긴다
-    prompt = (update.message.text or update.message.caption or "").strip()
-
     lock = chat_locks.setdefault(chat_id, asyncio.Lock())
+
+    # 작업 중 도착한 메시지 → 스티어링 큐에 기록. 훅이 진행 중 턴의 도구 호출
+    # 사이(PostToolUse)나 종료 직전(Stop)에 끼워 넣고, 못 끼워 넣으면 아래
+    # claim()이 다음 턴으로 처리한다 — 어느 쪽이든 메시지가 씹히지 않는다.
+    steer_id = None
+    steer_note = None
+    prompt: str | None = None
     if lock.locked():
-        await update.message.reply_text("🤔 이전 질문에 아직 답하는 중이에요. 잠시만요…")
+        prompt = await build_incoming_prompt(update, context)
+        if prompt is None:
+            return
+        steer_id = update.message.message_id
+        steering.enqueue(steering.steer_file(WORKDIR, chat_id), steer_id, prompt)
+        steer_note = await update.message.reply_text(
+            "📌 작업 중이네요 — 지금 하는 작업에 실시간으로 끼워 넣을게요. (안 되면 끝나는 대로 이어서 처리)"
+        )
+
+    async def edit_steer_note(text: str) -> None:
+        try:
+            await context.bot.edit_message_text(
+                text, chat_id=chat_id, message_id=steer_note.message_id
+            )
+        except Exception:
+            pass
 
     async with lock:
-        # 음성 메시지면 먼저 텍스트로 변환
-        if update.message.voice or update.message.audio:
-            await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-            transcript = await transcribe_voice(update)
-            if not transcript:
-                return  # 변환 실패 시 안내는 transcribe_voice가 이미 보냄
-            await update.message.reply_text(f"🎤 들은 내용: {transcript}")
-            prompt = transcript
-
-        attachment = await save_attachment(update, context)
-        if attachment:
-            # Claude가 읽을 수 있도록 저장 경로를 프롬프트에 포함
-            note = f"[사용자가 파일을 첨부함: {attachment}]"
-            prompt = f"{note}\n{prompt}" if prompt else f"{note}\n이 파일을 확인하고 설명해 주세요."
-        elif not prompt:
-            return  # 내용 없는 메시지는 무시
-
-        # 텔레그램 '답장(reply)'으로 보냈으면, 답장 대상 메시지를 맥락으로 붙인다.
-        # (봇의 이전 답변이든 내 메시지든 — 세션 히스토리 중 '어느 것에 대한 얘기인지' 짚어준다)
-        replied = update.message.reply_to_message
-        if replied:
-            prompt = build_prompt_with_reply(prompt, replied.text or replied.caption)
+        if steer_id is not None:
+            status, merged = steering.claim(steering.steer_file(WORKDIR, chat_id), steer_id)
+            if status == "injected":
+                await edit_steer_note("✅ 진행 중이던 작업에 실시간으로 반영했어요. 답변은 위 작업 결과에 포함돼요.")
+                return
+            if status == "gone":
+                await edit_steer_note("✅ 앞서 보낸 메시지와 합쳐서 처리했어요.")
+                return
+            prompt = merged  # 훅이 못 끼워 넣음 → 지금 pending 전부를 합쳐 이번 턴으로
+            await edit_steer_note("⏭ 앞 작업이 끝나서 이어서 바로 처리할게요.")
+        else:
+            prompt = await build_incoming_prompt(update, context)
+            if prompt is None:
+                return
 
         # 코딩 모드면 실행 전 잠깐 취소 기회를 준다 (잘못 보낸 명령 방어)
         status_msg = await update.message.reply_text("🤔 생각 중…")
@@ -1402,6 +1457,17 @@ def build_application(token: str) -> Application:
             else:
                 schedule_reminder(application, item)
         save_reminders()
+        # 재시작 탓에 훅 주입도 폴백 턴도 못 탄 스티어링 예약 메시지가 있으면
+        # 조용히 사라지게 두지 않고 내용을 알려준 뒤 큐를 비운다.
+        for chat_id, texts in steering.drain_leftovers(WORKDIR):
+            try:
+                listing = "\n".join(f"- {t[:200]}" for t in texts)
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text="🔁 재시작 때문에 예약돼 있던 메시지를 처리하지 못했어요. 필요하면 다시 보내주세요:\n" + listing,
+                )
+            except Exception:
+                pass
         # 봇이 시작·재시작되면 허용된 사용자에게 알린다. 예상치 못한 알림이 오면 문제 신호.
         if os.environ.get("STARTUP_NOTIFY", "1") != "0":
             for uid in ALLOWED_IDS:
@@ -1455,6 +1521,11 @@ def main() -> None:
     # 시작 시엔 실행 중인 작업이 없으므로 남아 있던 작업 표시를 지운다 (강제 종료 대비)
     running_procs.clear()
     _sync_busy_marker()
+
+    # 스티어링 훅을 workspace 설정에 병합 (기존 훅 보존, 반복 실행해도 안전).
+    # 훅은 봇과 같은 파이썬(venv)으로 돌린다 — 시스템 python3(3.9)와의 문법 차이 방지.
+    if not steering.ensure_steer_hooks(CLAUDE_SETTINGS_FILE, STEER_HOOK_SCRIPT, sys.executable):
+        log.warning("스티어링 훅 설정 병합 실패 — 실시간 끼워넣기 없이 예약 폴백만 동작합니다")
 
     app = build_application(token)
     log.info("봇 시작! (작업 폴더: %s)", WORKDIR)
