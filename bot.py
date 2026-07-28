@@ -377,6 +377,10 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # 기본 asyncio 스트림 한계는 64KB다. 이미지 Read(base64)나 큰 파일처럼
+        # stream-json 이벤트 한 줄이 64KB를 넘으면 LimitOverrunError로 죽어
+        # "처리 중 문제가 생겼어요"가 뜬다. 넉넉히 16MB로 올린다.
+        limit=16 * 1024 * 1024,
         cwd=str(workdir),
         start_new_session=True,  # 별도 프로세스 그룹 → 중단 시 자식까지 한 번에 정리
     )
@@ -389,7 +393,15 @@ async def run_claude(chat_id: int, prompt: str, on_progress=None, touched_files:
     async def read_stream() -> None:
         nonlocal final_text
         assert proc.stdout is not None
-        async for raw in proc.stdout:
+        while True:
+            try:
+                raw = await proc.stdout.readline()
+            except (ValueError, asyncio.LimitOverrunError):
+                # 위 limit로 거의 안 걸리지만, 한 줄이 그마저 넘으면 그 이벤트만 건너뛰고 계속 읽는다.
+                log.warning("스트림 이벤트 한 줄이 너무 커서 건너뜀")
+                continue
+            if not raw:
+                break  # EOF
             line = raw.decode(errors="replace").strip()
             if not line:
                 continue
