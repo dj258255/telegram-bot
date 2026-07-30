@@ -471,9 +471,11 @@ load_prefs()  # 저장된 설정 복원 — 재시작·재배포에도 모델·�
 
 
 async def run_claude(chat_id: int, thread: str, prompt: str, on_progress=None,
-                     touched_files: set | None = None) -> str:
+                     touched_files: set | None = None, on_text=None) -> str:
     """(chat_id, thread) 스레드의 세션으로 claude를 스트리밍 실행한다.
     tool_use가 나올 때마다 on_progress(설명) 콜백을 호출하고, 최종 답변 텍스트를 반환한다.
+    도구 호출 사이에 나온 설명 텍스트는 on_text(문단) 콜백으로 그때그때 흘려보낸다.
+    긴 작업에서 중간 안내가 사라지지 않게 하려는 것이고, 턴이 중단돼도 이미 보낸 말은 남는다.
     """
     tkey = (chat_id, thread)
     cmd = [CLAUDE_BIN, "-p", "--output-format", "stream-json", "--verbose"]
@@ -548,6 +550,15 @@ async def run_claude(chat_id: int, thread: str, prompt: str, on_progress=None,
                 if _m:
                     chat_last_model[chat_id] = _m  # 실제 사용 모델 버전 기록
                 for block in event.get("message", {}).get("content", []):
+                    # 도구 호출 사이에 쓴 설명 텍스트. 예전에는 여기서 버려져서
+                    # "이제 ○○ 할게" 같은 중간 안내가 채팅에 아예 오지 않았고,
+                    # 턴이 타임아웃이나 중단으로 죽으면 그 턴의 말이 통째로 사라졌다.
+                    # 하위 에이전트의 수다는 시끄러우니 최상위 텍스트만 흘려보낸다.
+                    if block.get("type") == "text" and on_text and parent_id is None:
+                        chunk = str(block.get("text", "") or "").strip()
+                        if chunk:
+                            await on_text(chunk)
+                        continue
                     if block.get("type") != "tool_use" or not on_progress:
                         continue
                     name = block.get("name", "")
@@ -1362,6 +1373,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         # 진행 상황 표시 + 중단 버튼
         actions: list[str] = []
+        streamed: list[str] = []  # 중간에 이미 보낸 설명 (끝에서 중복 제거용)
         last_edit = 0.0
         btn_targets[status_msg.message_id] = tkey
         stop_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
@@ -1394,6 +1406,20 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             await refresh("\n".join(actions[-6:]))
             await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
+        # 도구 호출 사이에 나온 설명을 그때그때 보낸다.
+        # 마지막 텍스트는 최종 답변과 같은 내용이 오므로, 보낸 것을 기억해 두고
+        # 끝에서 중복을 걸러낸다.
+        async def on_text(chunk: str) -> None:
+            nonlocal last_activity
+            last_activity = asyncio.get_event_loop().time()
+            streamed.append(chunk)
+            for part in split_message(chunk):
+                try:
+                    sent = await context.bot.send_message(chat_id=chat_id, text=part)
+                    remember_thread_msg(sent, thread)
+                except Exception:
+                    pass  # 중간 안내가 실패해도 본 작업은 계속한다
+
         async def heartbeat() -> None:
             """진행 신호가 뜸한 동안에도 '살아있음'을 보여준다.
             타이핑 표시를 유지하고, 오래 조용하면 경과 시간을 알린다."""
@@ -1413,7 +1439,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         touched: set[str] = set()
         hb = asyncio.create_task(heartbeat())
         try:
-            reply = await run_claude(chat_id, thread, prompt, on_progress=on_progress, touched_files=touched)
+            reply = await run_claude(chat_id, thread, prompt, on_progress=on_progress, touched_files=touched, on_text=on_text)
             # 답이 비어 끊긴 경우(큰 작업 중 출력이 잘림) 자동으로 이어서 계속 — 최대 2회
             auto = 0
             while not reply.strip() and auto < 2:
@@ -1421,12 +1447,16 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 await on_progress(f"↩︎ 답이 끊겨 이어서 계속하는 중 ({auto}/2)")
                 reply = await run_claude(
                     chat_id, thread, "직전 답변이 중간에 끊겼어. 이어서 계속해줘.",
-                    on_progress=on_progress, touched_files=touched,
+                    on_progress=on_progress, touched_files=touched, on_text=on_text,
                 )
         finally:
             hb.cancel()
         if not reply.strip():
             reply = "답을 만들다 계속 끊겼어요. 작업을 조금 더 작게 나눠 다시 보내주세요. (이어가려면 '계속')"
+        # 마지막 설명 텍스트는 최종 답변과 같은 내용으로 한 번 더 온다.
+        # 스트리밍으로 이미 보냈으면 같은 말을 두 번 띄우지 않는다.
+        if streamed and reply.strip() == streamed[-1].strip():
+            reply = ""
 
         # 진행 메시지 지우고 최종 답변 전송
         btn_targets.pop(status_msg.message_id, None)  # 이 턴을 가리키던 버튼 대상 정리
@@ -1444,12 +1474,17 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         others_running = any(cid == chat_id and th != thread for (cid, th) in running_procs)
         if thread != DEFAULT_THREAD or others_running:
             prefix = f"🧵 {thread}\n\n" + prefix
-        chunks = split_message(prefix + reply)
-        for chunk in chunks:
-            # 원래 요청에 대한 답장으로 보낸다. 텔레그램이 인용을 띄워줘서
-            # 여러 작업이 동시에 끝나도 어느 요청의 답인지 바로 보인다.
-            sent = await update.message.reply_text(chunk, reply_to_message_id=update.message.message_id)
-            remember_thread_msg(sent, thread)  # 이 답변에 답장하면 같은 스레드로 이어진다
+        # 본문을 이미 스트리밍으로 보냈으면 reply가 비어 있다. 그때 접두어만 또 보내면
+        # 빈 메시지처럼 보이므로, 긴 작업의 완료 표시만 남기고 짧은 작업은 그냥 넘긴다.
+        body = prefix + reply
+        if not reply.strip():
+            body = prefix.strip()
+        if body.strip():
+            for chunk in split_message(body):
+                # 원래 요청에 대한 답장으로 보낸다. 텔레그램이 인용을 띄워줘서
+                # 여러 작업이 동시에 끝나도 어느 요청의 답인지 바로 보인다.
+                sent = await update.message.reply_text(chunk, reply_to_message_id=update.message.message_id)
+                remember_thread_msg(sent, thread)  # 이 답변에 답장하면 같은 스레드로 이어진다
 
         # 긴 답변은 .md 파일로도 첨부 (저장·가독성)
         if not is_error and len(reply) > LONG_ANSWER_LIMIT:
